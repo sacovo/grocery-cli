@@ -1,8 +1,20 @@
-# coop-api
+# grocery
 
-A small Python wrapper around [coop.ch](https://www.coop.ch) for automating grocery
-shopping: search products, resolve recipe ingredients to real articles, and push them
-onto your Coop shopping list.
+Automate Swiss grocery shopping from recipes: search products, resolve recipe
+ingredients to real articles, and push them onto your shopping list.
+
+Two stores are supported, selected with `--store` (or `GROCERY_STORE`):
+
+| | coop.ch | migros.ch |
+| --- | --- | --- |
+| Access | scraped HTML behind DataDome | JSON API |
+| Product details | one page load each | batched by uid |
+| Dietary filters | filter-panel checkboxes | first-class facets |
+| Writes | click, then verify | one PUT that returns the new list |
+
+Both drive the same real Chrome, for different reasons: Coop because DataDome rejects
+automated browsers, Migros because its API needs an OAuth token only a signed-in browser
+obtains. Neither ever checks out.
 
 ## How it works, and why
 
@@ -20,7 +32,8 @@ Consequences worth knowing up front:
 
 - **A visible Chrome window is required.** No headless mode.
 - **You log in yourself, once.** The tool never handles your credentials. The session
-  persists in a dedicated profile at `~/.coop-api/chrome-profile`.
+  persists in a dedicated profile at `~/.grocery/chrome-profile` (an existing
+  `~/.coop-api/chrome-profile` keeps being used, so upgrading does not log you out).
 - Search works anonymously; anything touching the shopping list needs the login.
 - This is personal-scale automation. Don't point it at bulk scraping.
 
@@ -35,7 +48,14 @@ later runs reuse that profile.
 
 ## CLI
 
+`--store coop` (the default) or `--store migros` / `-s migros` picks the backend; the
+`GROCERY_STORE` environment variable sets it once.
+
 ```bash
+uv run coop -s migros search Vollmilch -n 5   # same commands, other store
+uv run coop -s migros list                    # Migros' list *is* its basket
+uv run coop -s migros add 100006357
+
 uv run coop search "Milch 3.5%" -n 10   # search products
 uv run coop product 6850514             # ingredients, allergens, nutrition
 uv run coop list                        # show the active shopping list
@@ -162,7 +182,7 @@ so the amount is reported as written and left for you to judge.
 ## Library
 
 ```python
-from coop_api import CoopClient, SearchFilters
+from grocery import CoopClient, SearchFilters
 
 with CoopClient() as coop:
     hits = coop.search("Milch 3.5%", limit=10)
@@ -184,7 +204,7 @@ with CoopClient() as coop:
     coop.create_list("Weihnachten")
 
     # recipe resolution with a soft preference
-    from coop_api.recipes import resolve
+    from grocery.recipes import resolve
     matches = resolve(coop, ["500 g Spaghetti"], prefer="budget")
     matches[0].best                    # Product
     matches[0].candidates              # best + alternatives, for your own picker
@@ -199,8 +219,8 @@ with CoopClient() as coop:
 ```
 
 Other entry points: `coop.category("m_0056")` lists a category, `coop.add_many([...])`
-adds in bulk, and `coop_api.recipes.resolve()` gives you ranked candidates per
-ingredient without writing anything. `coop_api.filters.ALL_PROPERTIES` lists every
+adds in bulk, and `grocery.recipes.resolve()` gives you ranked candidates per
+ingredient without writing anything. `grocery.stores.coop.filters.ALL_PROPERTIES` lists every
 nutritional facet Coop exposes (high protein, no added sugar, …), usable via
 `SearchFilters(properties=("HIGH_PROTEIN",))`.
 
@@ -270,6 +290,19 @@ still gets a column, empty for the rest.
 Both exports are **read-only**. `--list` switches to that list and switches back, so
 exporting never leaves a different list active.
 
+Store differences worth knowing before you import the output:
+
+- **Migros list prices are fetched separately.** Its shopping-list API returns no prices,
+  so they come from one batched product lookup — without that the `price` and
+  `line_total` columns would be empty.
+- **Migros ingredients/nutrition are scraped**, not from an API: nothing the site calls
+  exposes them. Nutrition there carries real units (`297 kJ (71 kcal)`), unlike Coop's
+  unitless `Energie` rows.
+- **Single-ingredient products have no ingredient list** at either store — milk exports
+  with an empty `ingredients` cell because there genuinely isn't one.
+- **`new-list` is Coop-only.** Migros lists must be created in its own app; the command
+  exits `2` with that message rather than pretending.
+
 `export products` costs one page load per product — a 110-item list takes minutes.
 Progress is reported on stderr so stdout stays pipeable, and a product that fails to
 load is skipped with a warning rather than aborting the run.
@@ -324,16 +357,20 @@ package launches Chrome, so it must import and call `subprocess`.
 
 | Module | Responsibility |
 | --- | --- |
-| `session.py` | Launching/attaching Chrome, DataDome and login detection |
-| `extractors.py` | Every JavaScript snippet that reads Coop's markup |
-| `client.py` | `CoopClient` — search, products, lists |
-| `filters.py` | Facet definitions and the `SearchFilters` selection |
-| `recipes.py` | Ingredient-line parsing and candidate ranking |
+| `browser.py` | Launching/attaching Chrome; bot-wall detection. Store-agnostic |
+| `errors.py` | `GroceryError`, `NotLoggedIn`, `BotWall` |
 | `models.py` | `Product`, `ProductDetail`, `ListItem`, `ShoppingList` |
-| `cli.py` | Typer commands |
+| `recipes.py` | Ingredient-line parsing and candidate ranking |
+| `export.py` | CSV/JSON exports |
+| `cli.py` | Typer commands and the `--store` switch |
+| `stores/base.py` | The `Store` protocol and `Capabilities` |
+| `stores/coop/` | `extractors.py` (all Coop selectors), `client.py`, `filters.py` |
+| `stores/migros/` | `session.py` (token capture), `client.py` (JSON API) |
 
-The split that matters is `extractors.py`: all the selector knowledge sits there, so a
-Coop redesign should touch one file rather than being spread through the client.
+Two splits matter. `stores/coop/extractors.py` holds every selector, so a Coop redesign
+touches one file. And `Capabilities` lets a store declare what it genuinely supports —
+anything it cannot do is refused with a message rather than emulated, which is why
+`--vegan` on a store without real dietary facets would error instead of guessing.
 
 ## Fragility
 

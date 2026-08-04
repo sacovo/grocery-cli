@@ -119,6 +119,23 @@ class SearchFilters:
         # Preserve order, drop duplicates.
         return list(dict.fromkeys(ids))
 
+    def as_kwargs(self) -> dict[str, bool]:
+        """The active flags as plain keywords.
+
+        This is the calling convention every store understands: a store that cannot
+        honour one of these must refuse it, never ignore it.
+        """
+        names = (
+            "vegan",
+            "vegetarian",
+            "lactose_free",
+            "gluten_free",
+            "bio",
+            "online_only",
+            "on_offer",
+        )
+        return {name: True for name in names if getattr(self, name, False)}
+
     def with_facet(self, facet: tuple[str, str]) -> SearchFilters:
         """A copy with one more raw facet applied."""
         clone = dataclasses.replace(self, extra_facets=(*self.extra_facets, facet))

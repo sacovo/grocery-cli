@@ -385,7 +385,13 @@ def _search_preferring(
     limit = max(candidates, 10)
     facet = PREFERENCES.get(prefer) if prefer else None
 
-    if facet is not None:
+    if (
+        facet is not None
+        and hasattr(base, "with_facet")
+        and hasattr(coop, "_apply_filters")
+    ):
+        # Facet-based preferences are the Coop mechanism; other stores fall through to
+        # the kwargs path below rather than pretending the bias was applied.
         try:
             hits = coop.search(term, limit=limit, filters=base.with_facet(facet))
             if hits:
@@ -398,7 +404,14 @@ def _search_preferring(
     # "cheapest" needs no facet - it is applied by sorting, so it never falls back.
     # Any facet preference that matched nothing also lands here, and does count as
     # a fallback.
-    return coop.search(term, limit=limit, filters=base), prefer == "cheapest"
+    if prefer == "bio" and not hasattr(coop, "_apply_filters"):
+        try:
+            hits = coop.search(term, limit=limit, **{**base.as_kwargs(), "bio": True})
+            if hits:
+                return hits, True
+        except GroceryError:
+            pass
+    return coop.search(term, limit=limit, **base.as_kwargs()), prefer == "cheapest"
 
 
 def _cheapest_first(hits: list[Product]) -> list[Product]:

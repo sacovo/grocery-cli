@@ -18,8 +18,9 @@ from .stores.coop.client import CoopClient
 from .stores.coop.filters import SearchFilters, normalise_preference
 
 app = typer.Typer(
-    help="Search coop.ch and manage your shopping list.", no_args_is_help=True
+    help="Search Swiss grocers and manage your shopping list.", no_args_is_help=True
 )
+
 # Human output on stdout, diagnostics on stderr, so `--json` stdout stays parseable.
 console = Console()
 err = Console(stderr=True)
@@ -40,6 +41,52 @@ class Exit:
 
 
 JsonOpt = typer.Option(False, "--json", help="Emit JSON on stdout instead of a table.")
+
+
+# Which backend the commands talk to. Set once by the global --store option so every
+# command does not have to grow its own copy.
+_STORE = "coop"
+
+STORES = {
+    "coop": "grocery.stores.coop:CoopClient",
+    "migros": "grocery.stores.migros:MigrosClient",
+}
+
+
+@app.callback()
+def _configure(
+    store: str = typer.Option(
+        "coop", "--store", "-s", envvar="GROCERY_STORE", help="coop or migros."
+    ),
+) -> None:
+    """Search Swiss grocers and manage your shopping list."""
+    global _STORE
+    if store not in STORES:
+        err.print(f"[red]Unknown store {store!r}. Known: {', '.join(STORES)}.[/]")
+        raise typer.Exit(Exit.ERROR)
+    _STORE = store
+
+
+def client():
+    """Instantiate the configured store's client."""
+    if _STORE == "migros":
+        from .stores.migros import MigrosClient
+
+        return MigrosClient()
+    from .stores.coop import CoopClient
+
+    return CoopClient()
+
+
+def _require(capability: str, what: str) -> None:
+    """Refuse a command the configured store cannot honour, rather than faking it."""
+    if _STORE == "migros":
+        from .stores.migros import MigrosClient as _C
+    else:
+        from .stores.coop import CoopClient as _C
+    if not getattr(_C.capabilities, capability, False):
+        err.print(f"[red]{_STORE} does not support {what}.[/]")
+        raise typer.Exit(Exit.ERROR)
 
 
 def _emit(payload: object) -> None:
@@ -92,8 +139,12 @@ def search(
 ) -> None:
     """Search products by free text, optionally filtered."""
     filters = _filters(vegan, vegetarian, lactose_free, gluten_free, bio)
-    with CoopClient() as coop:
-        hits = coop.search(query, limit=limit, category=category, filters=filters)
+    kwargs = filters.as_kwargs()
+    if category:
+        _require("categories", "--category")
+        kwargs["category"] = category
+    with client() as coop:
+        hits = coop.search(query, limit=limit, **kwargs)
     if as_json:
         _emit(
             {
@@ -113,8 +164,12 @@ def search(
 
 @app.command()
 def categories(query: str, as_json: bool = JsonOpt) -> None:
-    """Show category codes Coop suggests for a search term."""
-    with CoopClient() as coop:
+    """Show category codes the store suggests for a search term."""
+    _require("categories", "category suggestions")
+    if _STORE != "coop":
+        err.print("[red]Category suggestions are a coop feature.[/]")
+        raise typer.Exit(Exit.ERROR)
+    with client() as coop:
         found = coop.suggest_categories(query)
     if as_json:
         _emit({"query": query, "categories": found})
@@ -150,21 +205,32 @@ def status(as_json: bool = JsonOpt) -> None:
 
 
 def _gather_status() -> dict[str, object]:
-    info: dict[str, object] = {"chrome": False, "logged_in": False, "active_list": None}
+    info: dict[str, object] = {
+        "store": _STORE,
+        "chrome": False,
+        "logged_in": False,
+        "active_list": None,
+    }
     try:
-        with CoopClient() as coop:
+        with client() as coop:
             info["chrome"] = True
-            coop.session.goto("https://www.coop.ch/de/")
-            info["logged_in"] = coop.session.is_logged_in()
+            # Entering a Migros client already authenticates; Coop needs a page first.
+            if hasattr(coop.session, "is_logged_in"):
+                coop.session.goto(f"https://www.{_STORE}.ch/de/")
+                info["logged_in"] = coop.session.is_logged_in()
+            else:
+                info["logged_in"] = bool(coop.session.bearer)
             if info["logged_in"]:
                 active = next((lst for lst in coop.get_lists() if lst.active), None)
                 info["active_list"] = active.as_dict() if active else None
     except GroceryError as exc:
+        # NotLoggedIn subclasses GroceryError, so this covers both.
         info["error"] = str(exc)
     return info
 
 
 def _render_status(info: dict[str, object]) -> None:
+    console.print(f"Store:       {info.get('store', '?')}")
     console.print(f"Chrome:      {'up' if info['chrome'] else 'not reachable'}")
     console.print(f"Logged in:   {'yes' if info['logged_in'] else 'no'}")
     active_list = info["active_list"]
@@ -198,7 +264,7 @@ def _filter_label(filters: SearchFilters) -> str:
 @app.command("list")
 def show_list(as_json: bool = JsonOpt) -> None:
     """Show the active Coop shopping list."""
-    with CoopClient() as coop:
+    with client() as coop:
         items = coop.get_list()
     if as_json:
         _emit({"count": len(items), "items": [i.as_dict() for i in items]})
@@ -224,7 +290,7 @@ def show_list(as_json: bool = JsonOpt) -> None:
 @app.command()
 def lists(as_json: bool = JsonOpt) -> None:
     """Show all shopping lists; the active one is marked."""
-    with CoopClient() as coop:
+    with client() as coop:
         found = coop.get_lists()
     if as_json:
         _emit({"count": len(found), "lists": [lst.as_dict() for lst in found]})
@@ -242,7 +308,7 @@ def lists(as_json: bool = JsonOpt) -> None:
 @app.command()
 def use(name_or_id: str, as_json: bool = JsonOpt) -> None:
     """Make a shopping list the active one (matched by name or id)."""
-    with CoopClient() as coop:
+    with client() as coop:
         selected = coop.select_list(name_or_id)
         count = len(coop.get_list())
     if as_json:
@@ -254,7 +320,12 @@ def use(name_or_id: str, as_json: bool = JsonOpt) -> None:
 @app.command("new-list")
 def new_list(name: str, as_json: bool = JsonOpt) -> None:
     """Create a new shopping list. Coop makes the new list active."""
-    with CoopClient() as coop:
+    if _STORE != "coop":
+        err.print(
+            f"[red]{_STORE} cannot create lists from here; make it in the app.[/]"
+        )
+        raise typer.Exit(Exit.ERROR)
+    with client() as coop:
         created = coop.create_list(name)
     if as_json:
         _emit(created.as_dict())
@@ -267,7 +338,7 @@ def new_list(name: str, as_json: bool = JsonOpt) -> None:
 @app.command()
 def product(product_id: str, as_json: bool = JsonOpt) -> None:
     """Show a product's details: ingredients, allergens, nutrition."""
-    with CoopClient() as coop:
+    with client() as coop:
         d = coop.get_product(product_id)
 
     if as_json:
@@ -316,7 +387,7 @@ def product(product_id: str, as_json: bool = JsonOpt) -> None:
 @app.command()
 def add(product_ids: list[str], as_json: bool = JsonOpt) -> None:
     """Add products to the shopping list by ID. Idempotent."""
-    with CoopClient() as coop:
+    with client() as coop:
         results = {pid: coop.add_to_list(pid) for pid in product_ids}
     if as_json:
         _emit(
@@ -333,7 +404,7 @@ def add(product_ids: list[str], as_json: bool = JsonOpt) -> None:
 @app.command()
 def remove(product_ids: list[str], as_json: bool = JsonOpt) -> None:
     """Remove products from the shopping list by ID. Idempotent."""
-    with CoopClient() as coop:
+    with client() as coop:
         results = {pid: coop.remove_from_list(pid) for pid in product_ids}
     if as_json:
         _emit(
@@ -399,8 +470,16 @@ def export_list(
 
     Read-only: exporting a non-active list switches to it and switches back.
     """
-    with CoopClient() as coop, coop.using_list(name_or_id):
-        items = coop.get_list()
+    with client() as coop:
+        if name_or_id:
+            if not hasattr(coop, "using_list"):
+                coop.select_list(name_or_id)
+                items = coop.get_list()
+            else:
+                with coop.using_list(name_or_id):
+                    items = coop.get_list()
+        else:
+            items = coop.get_list()
     columns, rows = list_rows(items)
     _write_export(columns, rows, fmt, output)
 
@@ -428,7 +507,7 @@ def export_products(
         err.print("[red]Give product ids, or --from-list to take them from a list.[/]")
         raise typer.Exit(Exit.ERROR)
 
-    with CoopClient() as coop:
+    with client() as coop:
         if from_list:
             with coop.using_list(name_or_id):
                 product_ids = [item.product_id for item in coop.get_list()]
@@ -504,7 +583,7 @@ def recipe(
     if not as_json:
         _print_banner(filters, prefer)
 
-    with CoopClient() as coop:
+    with client() as coop:
         # Interactive mode shows a menu, so it needs more than the usual few.
         wanted = max(candidates + 1, 8) if interactive else candidates + 1
         matches = resolve(

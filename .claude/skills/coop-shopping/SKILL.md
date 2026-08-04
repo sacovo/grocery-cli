@@ -1,14 +1,32 @@
 ---
 name: coop-shopping
-description: Search products on coop.ch and manage Coop shopping lists via the `coop` CLI in this repo. Use when asked to find Swiss grocery products, check prices or ingredients/allergens, turn a recipe into a shopping list, or add/remove items on a Coop list. Covers dietary filters (vegan, gluten-free, …), category scoping, and JSON output for scripting.
+description: Search products on coop.ch and migros.ch and manage their shopping lists via the `coop` CLI in this repo. Use when asked to find Swiss grocery products, check prices or ingredients/allergens, turn a recipe into a shopping list, or add/remove items on a Coop list. Covers dietary filters (vegan, gluten-free, …), category scoping, and JSON output for scripting.
 ---
 
-# Coop shopping CLI
+# Swiss grocery CLI
 
-Wraps coop.ch. Every command drives a real Chrome browser, so treat it as a slow,
-stateful, side-effecting tool — not a fast HTTP API.
+Wraps coop.ch and migros.ch. Every command drives a real Chrome browser, so treat it as
+a stateful, side-effecting tool — not a fast HTTP API.
 
 Run from the repo root: `uv run coop <command>`.
+
+## Pick a store
+
+`--store coop` (default) or `--store migros` / `-s migros`; `GROCERY_STORE` sets it once.
+
+```bash
+uv run coop -s migros search Vollmilch --json
+```
+
+They differ in ways that matter:
+
+- **Migros is much faster.** It is a JSON API with batched product lookups; Coop is
+  scraped page-by-page. Prefer Migros for anything bulk.
+- **Migros' shopping list *is* its basket** — items on it show as "im Warenkorb" and feed
+  checkout. Coop's lists are separate from its cart. Neither ever checks out.
+- **Coop has category suggestions and `--prefer budget`; Migros does not.** Commands a
+  store cannot honour exit `2` with a message rather than guessing.
+- Both have real dietary facets, so `--vegan` and friends are trustworthy on either.
 
 ## Check readiness first
 
@@ -75,11 +93,22 @@ uv run coop export products --from-list -o p.csv      # every product on the lis
 - **Product export** carries `ingredients`, `allergens`, `storage`, `origin`, `gtin` and
   friends, plus dynamic `nutrition:*` and `info:*` columns unioned across the products.
 
-Both are read-only — `--list` switches to that list and switches back.
+Both are read-only — `--list` switches to that list and switches back. Both work on
+either store.
 
-`export products --from-list` is **one page load per product**: a 110-item list takes
-several minutes. Prefer explicit ids when the user only needs a few, warn before running
-the full-list variant, and set a long timeout.
+`export products --from-list` is **one page load per product** on both stores: a
+110-item list takes several minutes. Prefer explicit ids when the user only needs a few,
+warn before running the full-list variant, and set a long timeout.
+
+Store-specific caveats for exports:
+
+- Migros list prices come from a separate batched lookup, so they are present but cost
+  one extra request.
+- Migros ingredients/nutrition are scraped from the product page; its nutrition values
+  include units, Coop's `Energie` rows do not.
+- An empty `ingredients` cell usually means a single-ingredient product (milk, flour),
+  not a failure.
+- `new-list` works on Coop only; on Migros it exits `2`.
 
 `add` and `remove` are idempotent: adding twice does not duplicate, and the JSON
 separates `added` from `already_present`.
