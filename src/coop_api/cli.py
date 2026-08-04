@@ -10,7 +10,8 @@ from rich.console import Console
 from rich.table import Table
 
 from .client import CoopClient
-from .filters import SearchFilters
+from .filters import SearchFilters, normalise_preference
+from .models import Product
 from .recipes import Match, parse_recipe, resolve
 from .session import CoopError
 
@@ -241,6 +242,15 @@ def recipe(
     candidates: int = typer.Option(
         3, "--candidates", "-c", help="Alternatives to show."
     ),
+    prefer: str = typer.Option(
+        None,
+        "--prefer",
+        help='Bias picks: "bio", "budget" (Prix Garantie) or "cheapest". '
+        "A preference is soft - it is dropped when nothing matches it.",
+    ),
+    interactive: bool = typer.Option(
+        False, "--interactive", "-i", help="Choose each product yourself from a list."
+    ),
     vegan: bool = VeganOpt,
     vegetarian: bool = VegetarianOpt,
     lactose_free: bool = LactoseOpt,
@@ -249,8 +259,11 @@ def recipe(
 ) -> None:
     """Resolve recipe ingredients to Coop products.
 
-    Prints matches only; pass --add to write them to the shopping list. Dietary flags
-    apply to every ingredient, which is the point when cooking for guests.
+    Prints matches only; pass --add to write them to the shopping list, or --interactive
+    to pick each product yourself and confirm before anything is written.
+
+    Dietary flags are hard constraints applied to every ingredient - the point when
+    cooking for guests. --prefer is only a bias between otherwise acceptable products.
     """
     text = path.read_text(encoding="utf-8") if path else sys.stdin.read()
     lines = parse_recipe(text)
@@ -258,12 +271,30 @@ def recipe(
         console.print("[yellow]No ingredients found.[/]")
         raise typer.Exit(1)
 
+    try:
+        prefer = normalise_preference(prefer)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1) from exc
+
     filters = _filters(vegan, vegetarian, lactose_free, gluten_free, bio)
-    if label := _filter_label(filters):
-        console.print(f"[dim]Filters: {label}[/]\n")
+    banner = ", ".join(
+        filter(None, [_filter_label(filters), f"prefer {prefer}" if prefer else ""])
+    )
+    if banner:
+        console.print(f"[dim]{banner}[/]\n")
 
     with CoopClient() as coop:
-        matches = resolve(coop, lines, candidates=candidates + 1, filters=filters)
+        # Interactive mode shows a menu, so it needs more than the usual few.
+        wanted = max(candidates + 1, 8) if interactive else candidates + 1
+        matches = resolve(
+            coop, lines, candidates=wanted, filters=filters, prefer=prefer
+        )
+
+        if interactive:
+            _run_interactive(coop, matches)
+            return
+
         _render_matches(matches, filtered=bool(filters))
         _render_notes(matches, candidates)
 
@@ -273,6 +304,92 @@ def recipe(
             )
             return
         _apply_matches(coop, matches)
+
+
+def _run_interactive(coop: CoopClient, matches: list[Match]) -> None:
+    """Walk the ingredients one at a time, letting the user pick, then confirm once."""
+    chosen = _pick_products(matches)
+    if chosen is None:
+        console.print("\n[yellow]Aborted. Nothing was added.[/]")
+        return
+    if not chosen:
+        console.print("\n[yellow]Nothing selected.[/]")
+        return
+    _confirm_and_add(coop, chosen)
+
+
+def _pick_products(matches: list[Match]) -> list[tuple[Match, Product]] | None:
+    """Prompt once per ingredient. Returns ``None`` if the user aborted."""
+    chosen: list[tuple[Match, Product]] = []
+    for index, match in enumerate(matches, start=1):
+        console.print(
+            f"\n[bold]({index}/{len(matches)}) {match.line}[/]  [dim]-> {match.term}[/]"
+        )
+        options = match.candidates
+        if not options:
+            reason = f" - {match.note}" if match.note else ""
+            console.print(f"  [yellow]no products found[/]{reason}")
+            continue
+
+        _print_options(options)
+        picked = _prompt_choice(len(options))
+        if picked == "quit":
+            return None
+        if picked == "skip":
+            console.print("  [dim]skipped[/]")
+            continue
+        chosen.append((match, options[picked - 1]))
+    return chosen
+
+
+def _print_options(options: list[Product]) -> None:
+    for number, product in enumerate(options, start=1):
+        price = f"CHF {product.price:.2f}" if product.price is not None else "n/a"
+        size = f" · {product.quantity}" if product.quantity else ""
+        unit = f" · {product.unit_price}" if product.unit_price else ""
+        console.print(
+            f"  [cyan]{number:>2}[/] {product.name}  [dim]{price}{size}{unit}[/]"
+        )
+
+
+def _confirm_and_add(coop: CoopClient, chosen: list[tuple[Match, Product]]) -> None:
+    """Show the basket, then write it only after an explicit yes."""
+    console.print("\n[bold]Selected:[/]")
+    total = 0.0
+    for match, product in chosen:
+        price = f"CHF {product.price:.2f}" if product.price is not None else "n/a"
+        total += product.price or 0.0
+        console.print(f"  {match.term}: {product.name} [dim]({price})[/]")
+    console.print(f"  [dim]total ~CHF {total:.2f}[/]")
+
+    noun = "product" if len(chosen) == 1 else "products"
+    if not typer.confirm(
+        f"\nAdd {len(chosen)} {noun} to your shopping list?", default=False
+    ):
+        console.print("[yellow]Nothing was added.[/]")
+        return
+
+    results = coop.add_many([product for _, product in chosen])
+    for _, product in chosen:
+        state = "added" if results.get(product.id) else "already on list"
+        console.print(f"  {state}: {product.name}")
+
+
+def _prompt_choice(count: int) -> int | str:
+    """Ask which numbered option to take; ``s`` skips the ingredient, ``q`` aborts."""
+    while True:
+        raw = (
+            typer.prompt("  pick [number / s=skip / q=quit]", default="1")
+            .strip()
+            .lower()
+        )
+        if raw in ("q", "quit"):
+            return "quit"
+        if raw in ("s", "skip", ""):
+            return "skip"
+        if raw.isdigit() and 1 <= int(raw) <= count:
+            return int(raw)
+        console.print(f"  [red]Enter 1-{count}, or s / q.[/]")
 
 
 def _render_matches(matches: list[Match], *, filtered: bool) -> None:
@@ -295,6 +412,13 @@ def _render_notes(matches: list[Match], candidates: int) -> None:
     for m in matches:
         if m.note:
             console.print(f"[dim]  {m.term!r}: {m.note}[/]")
+    # A preference that quietly did not apply would otherwise look like it had.
+    for m in matches:
+        if m.best and m.preference and not m.preference_applied:
+            console.print(
+                f"[yellow]  no '{m.preference}' option for {m.term!r} - "
+                "used the normal best match[/]"
+            )
     for m in matches:
         if m.alternatives:
             alts = "; ".join(f"[{a.id}] {a.name}" for a in m.alternatives[:candidates])

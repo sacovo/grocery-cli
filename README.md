@@ -72,6 +72,56 @@ uv run coop search Rahm --vegan         # only plant-based cream alternatives
 uv run coop recipe carbonara.txt --vegan
 ```
 
+### Choosing between candidates
+
+`--prefer` biases which product a recipe resolves to:
+
+```bash
+uv run coop recipe carbonara.txt --prefer budget    # Prix Garantie where available
+uv run coop recipe carbonara.txt --prefer bio       # Naturaplan and other organics
+uv run coop recipe carbonara.txt --prefer cheapest  # lowest price wins
+```
+
+`budget` also answers to `"prix garantie"`, and `bio` to `"organic"`.
+
+**Filters and preferences are not the same thing**, and the difference is deliberate:
+
+| | Behaviour when nothing matches |
+| --- | --- |
+| `--vegan`, `--gluten-free`, … | Hard constraint. The ingredient is reported unresolved. |
+| `--prefer …` | Soft bias. Falls back to the normal best match and says so. |
+
+That asymmetry is the point: quietly dropping "vegan" could poison a guest, whereas
+quietly dropping "bio" just costs a preference. Fallbacks are always printed:
+
+```
+no 'bio' option for 'Alufolie' - used the normal best match
+```
+
+`bio` and `budget` use Coop's own facets (`bioFacet`, brand `Prix Garantie`) rather than
+matching on product names, so "Biotta" juice is not mistaken for an organic product.
+
+### Interactive mode
+
+`-i` / `--interactive` shows the candidates per ingredient and lets you pick:
+
+```bash
+uv run coop recipe carbonara.txt --interactive
+```
+
+```
+(2/3) 500 g Spaghetti  -> Spaghetti
+   1 Barilla Spaghetti No. 5  CHF 2.50 · 500g · 0.50/100g
+   2 Prix Garantie Spaghetti  CHF 1.20 · 1000g · 0.12/100g
+   3 Rummo Spaghetti No.3  CHF 2.80 · 500g · 0.56/100g
+  pick [number / s=skip / q=quit]:
+```
+
+`s` skips an ingredient, `q` aborts without writing anything. At the end you get the
+basket and a running total, and nothing is written until you confirm — so `--interactive`
+does not need `--add`. It combines with `--prefer` and the dietary flags, which change
+the order and contents of the candidate list.
+
 `recipe.txt` is one ingredient per line; `#` lines are ignored. Amounts and units are
 stripped before searching:
 
@@ -105,6 +155,13 @@ with CoopClient() as coop:
     coop.get_lists()                   # [ShoppingList(id, name, active), ...]
     coop.select_list("Grillabend")     # add_to_list/get_list now act on this one
     coop.create_list("Weihnachten")
+
+    # recipe resolution with a soft preference
+    from coop_api.recipes import resolve
+    matches = resolve(coop, ["500 g Spaghetti"], prefer="budget")
+    matches[0].best                    # Product
+    matches[0].candidates              # best + alternatives, for your own picker
+    matches[0].preference_applied      # False if the preference had to be dropped
 
     # full product data
     d = coop.get_product("6850514")

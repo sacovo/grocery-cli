@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 import re
 import urllib.parse
 
@@ -276,7 +275,7 @@ class CoopClient:
             raise CoopError(
                 f"Tried to select list {target.name!r} but it did not become active."
             )
-        return dataclasses.replace(target, active=True)
+        return ShoppingList(id=target.id, name=target.name, active=True)
 
     def create_list(self, name: str) -> ShoppingList:
         """Create a new shopping list.

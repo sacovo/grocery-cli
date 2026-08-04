@@ -11,6 +11,7 @@ goes through the checkboxes and verifies the result count actually moved.
 from __future__ import annotations
 
 import dataclasses
+from typing import cast
 
 # Facet group -> the checkbox id prefix used in the filter panel.
 NUTRITIONAL_GROUP = "nutritionalProperties"
@@ -48,6 +49,40 @@ FLAGS: dict[str, tuple[str, str]] = {
     "on_offer": ("specialOfferFacet", "true"),
 }
 
+# Soft preferences for picking between candidates. Unlike the flags above these are
+# never hard constraints: if a preference matches nothing, the caller falls back to the
+# unpreferred results rather than dropping the ingredient. A value of ``None`` means the
+# preference is applied by sorting the results instead of by a facet.
+PREFERENCES: dict[str, tuple[str, str] | None] = {
+    "bio": ("bioFacet", "true"),
+    "budget": ("petBrand", "Prix Garantie"),
+    "cheapest": None,
+}
+
+_PREFERENCE_ALIASES = {
+    "prix garantie": "budget",
+    "prix-garantie": "budget",
+    "prixgarantie": "budget",
+    "günstig": "budget",
+    "cheap": "cheapest",
+    "organic": "bio",
+    "naturaplan": "bio",
+}
+
+
+def normalise_preference(value: str | None) -> str | None:
+    """Map user input like ``"Prix Garantie"`` onto a known preference key."""
+    if value is None:
+        return None
+    key = value.strip().casefold()
+    if not key or key == "none":
+        return None
+    key = _PREFERENCE_ALIASES.get(key, key)
+    if key not in PREFERENCES:
+        known = sorted(set(PREFERENCES) | set(_PREFERENCE_ALIASES))
+        raise ValueError(f"Unknown preference {value!r}. Known: {', '.join(known)}")
+    return key
+
 
 @dataclasses.dataclass(slots=True)
 class SearchFilters:
@@ -65,6 +100,8 @@ class SearchFilters:
     online_only: bool = False
     on_offer: bool = False
     properties: tuple[str, ...] = ()
+    extra_facets: tuple[tuple[str, str], ...] = ()
+    """Raw ``(group, value)`` facets, used to carry soft preferences."""
 
     def checkbox_ids(self) -> list[str]:
         """The filter-panel checkbox ids this selection corresponds to."""
@@ -78,8 +115,14 @@ class SearchFilters:
         for raw in self.properties:
             value = ALL_PROPERTIES.get(raw.lower(), raw.upper())
             ids.append(f"{NUTRITIONAL_GROUP}-{value}")
+        ids.extend(f"{group}-{value}" for group, value in self.extra_facets)
         # Preserve order, drop duplicates.
         return list(dict.fromkeys(ids))
+
+    def with_facet(self, facet: tuple[str, str]) -> SearchFilters:
+        """A copy with one more raw facet applied."""
+        clone = dataclasses.replace(self, extra_facets=(*self.extra_facets, facet))
+        return cast("SearchFilters", clone)
 
     def __bool__(self) -> bool:
         return bool(self.checkbox_ids())
