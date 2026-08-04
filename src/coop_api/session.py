@@ -17,6 +17,7 @@ import time
 import urllib.request
 
 from playwright.sync_api import Browser, Page, sync_playwright
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from . import extractors as js
 
@@ -176,7 +177,14 @@ class CoopSession:
                 "once (scroll/click) to re-establish the session, then retry."
             )
         if wait_for:
-            self.page.wait_for_selector(wait_for, timeout=timeout)
+            try:
+                self.page.wait_for_selector(wait_for, timeout=timeout)
+            except PlaywrightTimeoutError as exc:
+                # Surface as a CoopError so callers never have to catch Playwright's
+                # exceptions to tell "this page is not what we expected" from a crash.
+                raise CoopError(
+                    f"{url} did not render {wait_for!r} within {timeout / 1000:g}s."
+                ) from exc
 
     def is_blocked(self) -> bool:
         return bool(self.page.evaluate(js.IS_BLOCKED))

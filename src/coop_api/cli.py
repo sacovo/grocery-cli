@@ -251,6 +251,12 @@ def recipe(
     interactive: bool = typer.Option(
         False, "--interactive", "-i", help="Choose each product yourself from a list."
     ),
+    skip_pantry: bool = typer.Option(
+        False,
+        "--skip-pantry",
+        help="Leave out spoon- and pinch-scale ingredients (EL, TL, Prise) — "
+        "the staples you probably already have.",
+    ),
     vegan: bool = VeganOpt,
     vegetarian: bool = VegetarianOpt,
     lactose_free: bool = LactoseOpt,
@@ -290,6 +296,16 @@ def recipe(
         matches = resolve(
             coop, lines, candidates=wanted, filters=filters, prefer=prefer
         )
+
+        if skip_pantry:
+            skipped = [m for m in matches if m.is_spoon_scale]
+            if skipped:
+                names = ", ".join(m.term for m in skipped)
+                console.print(f"[dim]Skipped {len(skipped)} pantry-scale: {names}[/]\n")
+            matches = [m for m in matches if not m.is_spoon_scale]
+            if not matches:
+                console.print("[yellow]Nothing left after skipping pantry items.[/]")
+                return
 
         if interactive:
             _run_interactive(coop, matches)
@@ -395,17 +411,27 @@ def _prompt_choice(count: int) -> int | str:
 def _render_matches(matches: list[Match], *, filtered: bool) -> None:
     table = Table(title=f"{len(matches)} ingredients", header_style="bold")
     table.add_column("Ingredient")
+    table.add_column("Amount", no_wrap=True)
     table.add_column("Search term", style="dim")
     table.add_column("Best match")
     table.add_column("Price", justify="right", no_wrap=True)
     reason = "no match under these filters" if filtered else "no match"
     for m in matches:
+        amount = str(m.amount) or "-"
+        if m.is_spoon_scale:
+            amount = f"[cyan]{amount}[/]"
         if m.best:
             price = f"{m.best.price:.2f}" if m.best.price is not None else "-"
-            table.add_row(m.line, m.term, f"[{m.best.id}] {m.best.name}", price)
+            table.add_row(m.line, amount, m.term, f"[{m.best.id}] {m.best.name}", price)
         else:
-            table.add_row(m.line, m.term, f"[red]{reason}[/]", "-")
+            table.add_row(m.line, amount, m.term, f"[red]{reason}[/]", "-")
     console.print(table)
+    if any(m.is_spoon_scale for m in matches):
+        console.print(
+            "[dim]  [cyan]cyan[/] amounts are spoon- or pinch-scale — no pack size "
+            "matches them, so you may already have these in. Use --skip-pantry to "
+            "leave them out.[/]"
+        )
 
 
 def _render_notes(matches: list[Match], candidates: int) -> None:

@@ -80,7 +80,9 @@ class CoopClient:
             params = urllib.parse.urlencode({"text": query, "pageSize": max(limit, 30)})
             url = f"{BASE}/{self.locale}/search/?{params}"
 
-        self._session.goto(url, wait_for=js.PRODUCT_TILE)
+        self._session.goto(url)
+        if not self._wait_for_lister():
+            return []
         self._apply_filters(filters)
         return self._collect(limit)
 
@@ -94,7 +96,9 @@ class CoopClient:
         """List products in a category, e.g. ``"m_0056"`` (Milch)."""
         params = urllib.parse.urlencode({"pageSize": max(limit, 30)})
         url = f"{BASE}/{self.locale}/c/{code}?{params}"
-        self._session.goto(url, wait_for=js.PRODUCT_TILE)
+        self._session.goto(url)
+        if not self._wait_for_lister():
+            return []
         self._apply_filters(self._merge_filters(filters, filter_kwargs))
         return self._collect(limit)
 
@@ -105,13 +109,28 @@ class CoopClient:
         cheese categories, which you can then pass as ``category=``.
         """
         params = urllib.parse.urlencode({"text": query})
-        self._session.goto(
-            f"{BASE}/{self.locale}/search/?{params}", wait_for=js.PRODUCT_TILE
-        )
+        self._session.goto(f"{BASE}/{self.locale}/search/?{params}")
+        if not self._wait_for_lister():
+            return []
         seen: dict[str, str] = {}
         for entry in self._session.page.evaluate(js.CATEGORIES):
             seen.setdefault(entry["code"], entry["name"])
         return [{"code": code, "name": name} for code, name in seen.items()]
+
+    def _wait_for_lister(self, timeout: float = 20000) -> bool:
+        """Wait for the result lister; False when the search matched nothing at all.
+
+        Coop has two distinct empty states. A term it understands but has no products
+        for (e.g. "Chiliflocken") still renders the lister, just with no tiles. A term
+        it does not recognise at all gets a generic page with no lister and only
+        recommendation carousels. Waiting on a product tile would hang for the full
+        timeout on both, so wait on the lister and treat its absence as "no results".
+        """
+        try:
+            self._session.page.wait_for_selector(js.RESULT_LISTER, timeout=timeout)
+        except PlaywrightTimeoutError:
+            return False
+        return True
 
     def _merge_filters(
         self, filters: SearchFilters | None, kwargs: dict

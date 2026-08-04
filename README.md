@@ -123,7 +123,7 @@ does not need `--add`. It combines with `--prefer` and the dietary flags, which 
 the order and contents of the candidate list.
 
 `recipe.txt` is one ingredient per line; `#` lines are ignored. Amounts and units are
-stripped before searching:
+parsed off before searching:
 
 ```
 # Spaghetti Carbonara
@@ -131,6 +131,33 @@ stripped before searching:
 200 g Speckwürfel
 4 Eier
 ```
+
+### Measurements
+
+Quantities are parsed, not just discarded, and shown in an `Amount` column. Handled:
+metric weights and volumes, spelled-out and abbreviated German units (`EL`/`Esslöffel`,
+`TL`/`Teelöffel`, `Msp`/`Messerspitze`, `Prise`, `Zehe`, `Bund`, `Scheibe`, `Glas`,
+`Päckchen`, …) including irregular plurals, plus fractions in every form recipes use
+them — `1/2`, `½`, `1½`. Ranges like `2-3 Zwiebeln` resolve to the upper bound, on the
+grounds that having too much is the cheaper mistake.
+
+**Spoon- and pinch-scale amounts are treated differently.** Nobody sells two tablespoons
+of olive oil, so `2 EL Olivenöl` tells you nothing about which pack to buy — and usually
+means a staple already in the cupboard. Those lines are flagged in the output, and
+`--skip-pantry` leaves them out:
+
+```bash
+uv run coop recipe aglio-e-olio.txt --skip-pantry
+# Skipped 3 pantry-scale: Olivenöl, Chiliflocken, Salz
+```
+
+The flag keys off the *unit*, not the ingredient, so it is a heuristic: `1 Prise Safran`
+gets skipped alongside the salt. It is off by default for that reason.
+
+**Units are deliberately not converted to grams or millilitres.** A tablespoon of flour
+and a tablespoon of oil differ by roughly a factor of two by weight, and a Swiss `EL` is
+not a US tablespoon. Converting would produce confident numbers that are quietly wrong,
+so the amount is reported as written and left for you to judge.
 
 ## Library
 
