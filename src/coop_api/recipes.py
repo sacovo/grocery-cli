@@ -12,9 +12,13 @@ from .session import CoopError
 
 # Leading amounts we strip before searching: "500g Spaghetti", "2 EL Olivenöl",
 # "1.5 dl Rahm", "2-3 Zwiebeln".
-_UNITS = r"(?:g|kg|mg|ml|cl|dl|l|EL|TL|Stk\.?|Stück|Prise|Bund|Dose|Packung|Pack|Zehe|Zehen)"
+_UNITS = (
+    r"(?:g|kg|mg|ml|cl|dl|l|EL|TL|Stk\.?|Stück|Prise|Bund|Dose|Packung|Pack|Zehe|Zehen)"
+)
 _AMOUNT = re.compile(
-    rf"^\s*\d+(?:[.,]\d+)?(?:\s*[-–/]\s*\d+(?:[.,]\d+)?)?\s*{_UNITS}?\b\.?\s*",
+    # The en dash in the character class is deliberate: recipes write quantity ranges
+    # with an en dash at least as often as with a plain hyphen.
+    rf"^\s*\d+(?:[.,]\d+)?(?:\s*[-–/]\s*\d+(?:[.,]\d+)?)?\s*{_UNITS}?\b\.?\s*",  # noqa: RUF001
     re.IGNORECASE,
 )
 _NOISE = re.compile(
@@ -52,15 +56,17 @@ class Match:
         return self.best is not None
 
 
-def _score(product: Product, term: str, rank: int) -> tuple:
-    """Rank candidates: deliverable first, then Coop's own relevance.
+def _rank_candidates(hits: list[Product]) -> list[Product]:
+    """Order candidates: deliverable ones first, otherwise keep Coop's relevance.
 
-    Deliberately does *not* reward a literal substring match. Coop's search understands
-    that "Parmesan" means Parmigiano Reggiano; a substring test does not, and scoring on
-    it promotes "Knorr Risotto Parmesan" over actual cheese. Its relevance ordering beats
-    anything reconstructable from the product name, so only the orderable flag overrides.
+    Deliberately does *not* reward a literal substring match on the search term. Coop's
+    search understands that "Parmesan" means Parmigiano Reggiano; a substring test does
+    not, and scoring on it promotes "Knorr Risotto Parmesan" over actual cheese. Coop's
+    ordering beats anything reconstructable from the product name, so the only thing
+    worth overriding it for is whether the product can actually be delivered.
     """
-    return (not product.orderable, rank)
+    # sorted() is stable, so products with equal keys keep Coop's relevance order.
+    return sorted(hits, key=lambda product: not product.orderable)
 
 
 def resolve(
@@ -79,32 +85,40 @@ def resolve(
     An ingredient whose filters exclude everything comes back unresolved rather than
     falling back to an unfiltered match, so a restriction can never be quietly dropped.
     """
-    matches: list[Match] = []
-    for line in lines:
-        term = clean_ingredient(line)
-        if not term:
-            matches.append(Match(line=line, term=term, best=None))
-            continue
-        try:
-            hits = coop.search(term, limit=max(candidates, 10), filters=filters)
-        except CoopError as exc:
-            matches.append(Match(line=line, term=term, best=None, note=str(exc)))
-            continue
-        if orderable_only:
-            hits = [h for h in hits if h.orderable] or hits
-        ranked = {p.id: i for i, p in enumerate(hits)}
-        hits.sort(key=lambda p: _score(p, term, ranked[p.id]))
-        matches.append(
-            Match(
-                line=line,
-                term=term,
-                best=hits[0] if hits else None,
-                alternatives=hits[1:candidates],
-            )
-        )
-    return matches
+    return [
+        _resolve_line(coop, line, candidates, orderable_only, filters) for line in lines
+    ]
+
+
+def _resolve_line(
+    coop: CoopClient,
+    line: str,
+    candidates: int,
+    orderable_only: bool,
+    filters: SearchFilters | None,
+) -> Match:
+    term = clean_ingredient(line)
+    if not term:
+        return Match(line=line, term=term, best=None)
+    try:
+        hits = coop.search(term, limit=max(candidates, 10), filters=filters)
+    except CoopError as exc:
+        return Match(line=line, term=term, best=None, note=str(exc))
+    if orderable_only:
+        hits = [h for h in hits if h.orderable] or hits
+    hits = _rank_candidates(hits)
+    return Match(
+        line=line,
+        term=term,
+        best=hits[0] if hits else None,
+        alternatives=hits[1:candidates],
+    )
 
 
 def parse_recipe(text: str) -> list[str]:
     """Split a recipe/ingredient blob into individual lines."""
-    return [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    return [
+        ln.strip()
+        for ln in text.splitlines()
+        if ln.strip() and not ln.strip().startswith("#")
+    ]

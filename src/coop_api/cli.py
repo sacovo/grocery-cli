@@ -11,10 +11,12 @@ from rich.table import Table
 
 from .client import CoopClient
 from .filters import SearchFilters
-from .recipes import parse_recipe, resolve
+from .recipes import Match, parse_recipe, resolve
 from .session import CoopError
 
-app = typer.Typer(help="Search coop.ch and manage your shopping list.", no_args_is_help=True)
+app = typer.Typer(
+    help="Search coop.ch and manage your shopping list.", no_args_is_help=True
+)
 console = Console()
 
 # Shared dietary options, so `search` and `recipe` behave identically.
@@ -23,7 +25,9 @@ VegetarianOpt = typer.Option(False, "--vegetarian", help="Only vegetarian produc
 LactoseOpt = typer.Option(False, "--lactose-free", help="Only lactose-free products.")
 GlutenOpt = typer.Option(False, "--gluten-free", help="Only gluten-free products.")
 BioOpt = typer.Option(False, "--bio", help="Only organic products.")
-CategoryOpt = typer.Option(None, "--category", help="Scope to a category code, e.g. m_0056.")
+CategoryOpt = typer.Option(
+    None, "--category", help="Scope to a category code, e.g. m_0056."
+)
 
 
 def _products_table(products, title: str) -> Table:
@@ -58,13 +62,7 @@ def search(
     bio: bool = BioOpt,
 ) -> None:
     """Search products by free text, optionally filtered."""
-    filters = SearchFilters(
-        vegan=vegan,
-        vegetarian=vegetarian,
-        lactose_free=lactose_free,
-        gluten_free=gluten_free,
-        bio=bio,
-    )
+    filters = _filters(vegan, vegetarian, lactose_free, gluten_free, bio)
     with CoopClient() as coop:
         hits = coop.search(query, limit=limit, category=category, filters=filters)
     if not hits:
@@ -91,6 +89,18 @@ def categories(query: str) -> None:
     console.print(table)
 
 
+def _filters(
+    vegan: bool, vegetarian: bool, lactose_free: bool, gluten_free: bool, bio: bool
+) -> SearchFilters:
+    return SearchFilters(
+        vegan=vegan,
+        vegetarian=vegetarian,
+        lactose_free=lactose_free,
+        gluten_free=gluten_free,
+        bio=bio,
+    )
+
+
 def _filter_label(filters: SearchFilters) -> str:
     active = [
         name
@@ -115,7 +125,10 @@ def show_list() -> None:
     table.add_column("Price", justify="right", no_wrap=True)
     for i in items:
         table.add_row(
-            str(i.quantity), i.product_id, i.name, f"{i.price:.2f}" if i.price is not None else "-"
+            str(i.quantity),
+            i.product_id,
+            i.name,
+            f"{i.price:.2f}" if i.price is not None else "-",
         )
     console.print(table)
 
@@ -149,7 +162,9 @@ def new_list(name: str) -> None:
     """Create a new shopping list. Coop makes the new list active."""
     with CoopClient() as coop:
         created = coop.create_list(name)
-    console.print(f"Created [bold]{created.name}[/] ({created.id}) — it is now the active list.")
+    console.print(
+        f"Created [bold]{created.name}[/] ({created.id}) — it is now the active list."
+    )
 
 
 @app.command()
@@ -158,15 +173,19 @@ def product(product_id: str) -> None:
     with CoopClient() as coop:
         d = coop.get_product(product_id)
 
-    console.print(f"\n[bold]{d.name}[/]" + (f"  [dim]({d.brand})[/]" if d.brand else ""))
+    console.print(
+        f"\n[bold]{d.name}[/]" + (f"  [dim]({d.brand})[/]" if d.brand else "")
+    )
     price = f"CHF {d.price:.2f}" if d.price is not None else "n/a"
-    console.print(f"[dim]{d.id} · {price}" + (f" · EAN {d.gtin}" if d.gtin else "") + "[/]\n")
+    console.print(
+        f"[dim]{d.id} · {price}" + (f" · EAN {d.gtin}" if d.gtin else "") + "[/]\n"
+    )
 
     if d.ingredients:
         console.print("[bold]Zutaten[/]")
         console.print(f"  {d.ingredients}")
     if d.allergens:
-        console.print(f"\n[bold]Allergens[/] [dim](highlighted by Coop)[/]")
+        console.print("\n[bold]Allergens[/] [dim](highlighted by Coop)[/]")
         console.print("  " + ", ".join(d.allergens))
     for label, value in (
         ("Herkunft", d.origin),
@@ -178,7 +197,9 @@ def product(product_id: str) -> None:
 
     if d.nutrition:
         table = Table(
-            title=f"Nährwerte pro {d.nutrition_base or '?'}", header_style="bold", title_justify="left"
+            title=f"Nährwerte pro {d.nutrition_base or '?'}",
+            header_style="bold",
+            title_justify="left",
         )
         table.add_column("")
         table.add_column("", justify="right")
@@ -217,7 +238,9 @@ def recipe(
     add_to_list: bool = typer.Option(
         False, "--add", help="Actually add the matches to the shopping list."
     ),
-    candidates: int = typer.Option(3, "--candidates", "-c", help="Alternatives to show."),
+    candidates: int = typer.Option(
+        3, "--candidates", "-c", help="Alternatives to show."
+    ),
     vegan: bool = VeganOpt,
     vegetarian: bool = VegetarianOpt,
     lactose_free: bool = LactoseOpt,
@@ -235,59 +258,59 @@ def recipe(
         console.print("[yellow]No ingredients found.[/]")
         raise typer.Exit(1)
 
-    filters = SearchFilters(
-        vegan=vegan,
-        vegetarian=vegetarian,
-        lactose_free=lactose_free,
-        gluten_free=gluten_free,
-        bio=bio,
-    )
+    filters = _filters(vegan, vegetarian, lactose_free, gluten_free, bio)
     if label := _filter_label(filters):
         console.print(f"[dim]Filters: {label}[/]\n")
 
     with CoopClient() as coop:
         matches = resolve(coop, lines, candidates=candidates + 1, filters=filters)
-
-        table = Table(title=f"{len(matches)} ingredients", header_style="bold")
-        table.add_column("Ingredient")
-        table.add_column("Search term", style="dim")
-        table.add_column("Best match")
-        table.add_column("Price", justify="right", no_wrap=True)
-        for m in matches:
-            if m.best:
-                table.add_row(
-                    m.line,
-                    m.term,
-                    f"[{m.best.id}] {m.best.name}",
-                    f"{m.best.price:.2f}" if m.best.price is not None else "-",
-                )
-            else:
-                reason = "no match under these filters" if filters else "no match"
-                table.add_row(m.line, m.term, f"[red]{reason}[/]", "-")
-        console.print(table)
-
-        for m in matches:
-            if m.note:
-                console.print(f"[dim]  {m.term!r}: {m.note}[/]")
-
-        for m in matches:
-            if m.alternatives:
-                alts = "; ".join(f"[{a.id}] {a.name}" for a in m.alternatives[:candidates])
-                console.print(f"[dim]  alternatives for {m.term!r}: {alts}[/]")
+        _render_matches(matches, filtered=bool(filters))
+        _render_notes(matches, candidates)
 
         if not add_to_list:
-            console.print("\n[dim]Nothing was added. Re-run with --add to write to your list.[/]")
+            console.print(
+                "\n[dim]Nothing was added. Re-run with --add to write to your list.[/]"
+            )
             return
+        _apply_matches(coop, matches)
 
-        console.print()
-        for m in matches:
-            if not m.best:
-                console.print(f"  [red]skipped[/] {m.line} (no match)")
-        resolved = [m.best for m in matches if m.best]
-        results = coop.add_many(resolved)
-        for product in resolved:
-            state = "added" if results.get(product.id) else "already on list"
-            console.print(f"  {state}: {product.name}")
+
+def _render_matches(matches: list[Match], *, filtered: bool) -> None:
+    table = Table(title=f"{len(matches)} ingredients", header_style="bold")
+    table.add_column("Ingredient")
+    table.add_column("Search term", style="dim")
+    table.add_column("Best match")
+    table.add_column("Price", justify="right", no_wrap=True)
+    reason = "no match under these filters" if filtered else "no match"
+    for m in matches:
+        if m.best:
+            price = f"{m.best.price:.2f}" if m.best.price is not None else "-"
+            table.add_row(m.line, m.term, f"[{m.best.id}] {m.best.name}", price)
+        else:
+            table.add_row(m.line, m.term, f"[red]{reason}[/]", "-")
+    console.print(table)
+
+
+def _render_notes(matches: list[Match], candidates: int) -> None:
+    for m in matches:
+        if m.note:
+            console.print(f"[dim]  {m.term!r}: {m.note}[/]")
+    for m in matches:
+        if m.alternatives:
+            alts = "; ".join(f"[{a.id}] {a.name}" for a in m.alternatives[:candidates])
+            console.print(f"[dim]  alternatives for {m.term!r}: {alts}[/]")
+
+
+def _apply_matches(coop: CoopClient, matches: list[Match]) -> None:
+    console.print()
+    for m in matches:
+        if not m.best:
+            console.print(f"  [red]skipped[/] {m.line} (no match)")
+    resolved = [m.best for m in matches if m.best]
+    results = coop.add_many(resolved)
+    for product in resolved:
+        state = "added" if results.get(product.id) else "already on list"
+        console.print(f"  {state}: {product.name}")
 
 
 def main() -> None:

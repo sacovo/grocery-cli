@@ -151,13 +151,43 @@ article, which is handy for re-resolving a saved shopping list.
 - **Ordering is deliberately out of scope.** Nothing here places an order; checkout
   stays manual.
 
+## Development
+
+Code quality runs through [qlty](https://qlty.sh) (ruff for lint/format, bandit for
+security, radarlint for complexity):
+
+```bash
+qlty fmt --all      # format
+qlty check --all    # lint + security
+qlty smells --all   # complexity and duplication
+```
+
+Ruff configuration lives in `.ruff.toml` at the repo root rather than in
+`pyproject.toml`, so the local CLI, editors and qlty's bundled ruff all read the same
+settings. Two `# nosec` suppressions in `session.py` are deliberate and annotated: this
+package launches Chrome, so it must import and call `subprocess`.
+
+## Layout
+
+| Module | Responsibility |
+| --- | --- |
+| `session.py` | Launching/attaching Chrome, DataDome and login detection |
+| `extractors.py` | Every JavaScript snippet that reads Coop's markup |
+| `client.py` | `CoopClient` — search, products, lists |
+| `filters.py` | Facet definitions and the `SearchFilters` selection |
+| `recipes.py` | Ingredient-line parsing and candidate ranking |
+| `models.py` | `Product`, `ProductDetail`, `ListItem`, `ShoppingList` |
+| `cli.py` | Typer commands |
+
+The split that matters is `extractors.py`: all the selector knowledge sits there, so a
+Coop redesign should touch one file rather than being spread through the client.
+
 ## Fragility
 
 Product data is read from listing markup (`[data-producttile-wrapper]` and friends), so
-a Coop redesign will break extraction. The selectors are contained in `_EXTRACT_TILES`,
-`_EXTRACT_LIST` and `_EXTRACT_CATEGORIES` in `client.py` — that's the first place to
-look. `BotWall` is raised if DataDome ever intercepts a navigation; interacting with the
-Chrome window once and retrying usually clears it.
+a Coop redesign will break extraction. Every selector lives in `extractors.py` — that's
+the first place to look. `BotWall` is raised if DataDome ever intercepts a navigation;
+interacting with the Chrome window once and retrying usually clears it.
 
 Two traps worth remembering if you touch the search code:
 

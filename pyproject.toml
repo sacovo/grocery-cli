@@ -18,3 +18,5 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/coop_api"]
+
+# Lint/format configuration lives in .ruff.toml at the repo root.

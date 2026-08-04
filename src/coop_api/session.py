@@ -8,15 +8,19 @@ user's own logged-in session - no fingerprint spoofing involved.
 
 from __future__ import annotations
 
+import logging
 import pathlib
 import shutil
 import socket
-import subprocess
+import subprocess  # nosec B404 - launching Chrome is this module's whole purpose
 import time
-import urllib.error
 import urllib.request
 
 from playwright.sync_api import Browser, Page, sync_playwright
+
+from . import extractors as js
+
+log = logging.getLogger(__name__)
 
 DEFAULT_PORT = 9222
 DEFAULT_PROFILE = pathlib.Path.home() / ".coop-api" / "chrome-profile"
@@ -44,10 +48,15 @@ def _port_open(port: int, host: str = "127.0.0.1") -> bool:
 
 
 def _debug_ready(port: int) -> bool:
+    """True if a Chrome DevTools endpoint answers on ``port``."""
+    # Fixed scheme and loopback host, with an int port - the URL cannot be steered
+    # elsewhere by a caller, so the "audit url open" warning does not apply here.
+    url = f"http://127.0.0.1:{int(port)}/json/version"
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1):
+        with urllib.request.urlopen(url, timeout=1):  # nosec B310 - literal http://127.0.0.1
             return True
-    except (urllib.error.URLError, OSError):
+    except OSError:
+        # urllib.error.URLError subclasses OSError, so this covers both.
         return False
 
 
@@ -79,15 +88,18 @@ def launch_chrome(
         raise CoopError(f"Port {port} is in use but is not a Chrome debug endpoint.")
 
     profile.mkdir(parents=True, exist_ok=True)
-    proc = subprocess.Popen(
-        [
-            chrome_path or find_chrome(),
-            f"--remote-debugging-port={port}",
-            f"--user-data-dir={profile}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            BASE,
-        ],
+    argv = [
+        chrome_path or find_chrome(),
+        f"--remote-debugging-port={int(port)}",
+        f"--user-data-dir={profile}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        BASE,
+    ]
+    # No shell, fixed argument list, and the executable is either resolved from a
+    # known-name allowlist via shutil.which or supplied explicitly by the caller.
+    proc = subprocess.Popen(  # nosec B603 - shell=False with a fixed argv
+        argv,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -138,7 +150,9 @@ class CoopSession:
             self._owns_chrome = self._proc is not None
 
         self._pw = sync_playwright().start()
-        self._browser = self._pw.chromium.connect_over_cdp(f"http://127.0.0.1:{self.port}")
+        self._browser = self._pw.chromium.connect_over_cdp(
+            f"http://127.0.0.1:{self.port}"
+        )
         if not self._browser.contexts:
             raise CoopError("Chrome exposed no browser context.")
         ctx = self._browser.contexts[0]
@@ -151,7 +165,9 @@ class CoopSession:
             raise CoopError("Session not started - use `with CoopSession() as s:`.")
         return self._page
 
-    def goto(self, url: str, *, wait_for: str | None = None, timeout: float = 30000) -> None:
+    def goto(
+        self, url: str, *, wait_for: str | None = None, timeout: float = 30000
+    ) -> None:
         """Navigate and fail loudly if DataDome intercepted the request."""
         self.page.goto(url, wait_until="domcontentloaded", timeout=timeout)
         if self.is_blocked():
@@ -163,16 +179,10 @@ class CoopSession:
             self.page.wait_for_selector(wait_for, timeout=timeout)
 
     def is_blocked(self) -> bool:
-        return bool(
-            self.page.evaluate(
-                "() => !!document.querySelector('script[src*=\"captcha-delivery\"]')"
-            )
-        )
+        return bool(self.page.evaluate(js.IS_BLOCKED))
 
     def is_logged_in(self) -> bool:
-        # A logout link is only rendered for authenticated sessions; the account link
-        # and the shopping-list toggles are present anonymously too.
-        return bool(self.page.evaluate("() => !!document.querySelector('a[href*=\"/logout\"]')"))
+        return bool(self.page.evaluate(js.IS_LOGGED_IN))
 
     def require_login(self) -> None:
         if not self.is_logged_in():
@@ -182,18 +192,24 @@ class CoopSession:
             )
 
     def close(self) -> None:
-        """Detach. Chrome keeps running unless we started it ourselves."""
+        """Detach. Chrome keeps running unless we started it ourselves.
+
+        Teardown failures are logged rather than raised: `close` runs from `__exit__`,
+        where letting a detach error propagate would mask the real exception.
+        """
         if self._browser is not None:
             try:
                 self._browser.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug(
+                    "Ignoring error while closing the browser connection: %s", exc
+                )
             self._browser = None
         if self._pw is not None:
             try:
                 self._pw.stop()
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("Ignoring error while stopping Playwright: %s", exc)
             self._pw = None
         self._page = None
 
