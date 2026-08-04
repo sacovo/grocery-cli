@@ -55,6 +55,8 @@ later runs reuse that profile.
 uv run coop -s migros search Vollmilch -n 5   # same commands, other store
 uv run coop -s migros list                    # Migros' list *is* its basket
 uv run coop -s migros add 100006357
+uv run coop -s migros new-list "Grillabend"     # create
+uv run coop -s migros delete-list "Grillabend"  # delete (Migros only, confirms first)
 
 uv run coop search "Milch 3.5%" -n 10   # search products
 uv run coop product 6850514             # ingredients, allergens, nutrition
@@ -250,8 +252,11 @@ article, which is handy for re-resolving a saved shopping list.
 - **Nutrition values are verbatim.** Coop prints two `Energie` rows (kJ then kcal) with
   no unit on either, so both appear as-is rather than being labelled by guesswork.
 - **List operations act on the active list.** `select_list` changes which list
-  `get_list`/`add_to_list` touch, and Coop makes a newly created list active. There is
-  deliberately no delete-list support.
+  `get_list`/`add_to_list` touch, and a newly created list becomes active.
+- **Deleting lists is Migros-only**, because only Migros exposes an endpoint for it
+  (`DELETE /shopping-list/public/v1/list/delete/{id}`). It is permanent with no undo, so
+  `coop -s migros delete-list NAME` confirms first; `--yes` skips that for scripts. Coop
+  has no equivalent and says so.
 - **Ordering is deliberately out of scope.** Nothing here places an order; checkout
   stays manual.
 
@@ -300,8 +305,8 @@ Store differences worth knowing before you import the output:
   unitless `Energie` rows.
 - **Single-ingredient products have no ingredient list** at either store — milk exports
   with an empty `ingredients` cell because there genuinely isn't one.
-- **`new-list` is Coop-only.** Migros lists must be created in its own app; the command
-  exits `2` with that message rather than pretending.
+- **`new-list` works on both stores.** Migros creates via
+  `POST /shopping-list/public/v1/list`.
 
 `export products` costs one page load per product — a 110-item list takes minutes.
 Progress is reported on stderr so stdout stays pipeable, and a product that fails to

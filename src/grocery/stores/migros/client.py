@@ -391,6 +391,54 @@ class MigrosClient:
                 return ShoppingList(id=lst.id, name=lst.name, active=True)
         raise GroceryError(f"No Migros shopping list matching {name_or_id!r}.")
 
+    def create_list(self, name: str) -> ShoppingList:
+        """Create a shopping list.
+
+        Refuses a duplicate name, as Coop's does: Migros will happily create two lists
+        called the same thing and then you cannot tell them apart. Note there is no
+        delete endpoint - `/shopping-list/public/v1/list` allows POST only - so a list
+        made here can only be removed in the Migros app.
+        """
+        name = name.strip()
+        if not name:
+            raise ValueError("List name must not be empty.")
+        if any(lst.name.casefold() == name.casefold() for lst in self.get_lists()):
+            raise GroceryError(f"A Migros list named {name!r} already exists.")
+
+        created = self._api("POST", "/shopping-list/public/v1/list", {"name": name})
+        new_id = str((created or {}).get("shoppingListId") or "")
+        if not new_id:
+            raise GroceryError(f"Migros did not return an id when creating {name!r}.")
+        self._list_id = int(new_id)
+        return ShoppingList(id=new_id, name=name, active=True)
+
+    def delete_list(self, name_or_id: str) -> ShoppingList:
+        """Delete a shopping list permanently. There is no undo.
+
+        Only exposed because Migros provides the endpoint; the CLI still makes the
+        caller confirm, and the Coop backend deliberately has no equivalent.
+        """
+        target = next(
+            (
+                lst
+                for lst in self.get_lists()
+                if lst.id == str(name_or_id)
+                or lst.name.casefold() == str(name_or_id).casefold()
+            ),
+            None,
+        )
+        if target is None:
+            raise GroceryError(f"No Migros shopping list matching {name_or_id!r}.")
+
+        self._api("DELETE", f"/shopping-list/public/v1/list/delete/{target.id}")
+        if any(lst.id == target.id for lst in self.get_lists()):
+            raise GroceryError(
+                f"Migros accepted the delete but {target.name!r} remains."
+            )
+        if self._list_id == int(target.id):
+            self._list_id = None
+        return target
+
     def get_list(self, *, with_prices: bool = True) -> list[ListItem]:
         """The active list. Prices are looked up separately - see `_add_prices`."""
         list_id = self.active_list_id()

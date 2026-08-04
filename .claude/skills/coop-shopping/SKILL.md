@@ -24,8 +24,9 @@ They differ in ways that matter:
   scraped page-by-page. Prefer Migros for anything bulk.
 - **Migros' shopping list *is* its basket** — items on it show as "im Warenkorb" and feed
   checkout. Coop's lists are separate from its cart. Neither ever checks out.
-- **Coop has category suggestions and `--prefer budget`; Migros does not.** Commands a
-  store cannot honour exit `2` with a message rather than guessing.
+- **Coop has category suggestions and `--prefer budget`; Migros does not.** Migros has
+  list deletion; Coop does not. Commands a store cannot honour exit `2` with a message
+  rather than guessing.
 - Both have real dietary facets, so `--vegan` and friends are trustworthy on either.
 
 ## Check readiness first
@@ -71,6 +72,7 @@ uv run coop list --json                          # the active shopping list
 uv run coop lists --json                         # all lists, active one flagged
 uv run coop use "SoLa Di-Do"                     # switch active list
 uv run coop new-list "Grillabend"                # create (becomes active)
+uv run coop -s migros delete-list "Grillabend"   # delete (Migros only, permanent)
 uv run coop add 6850514 7362485 --json           # add by product id
 uv run coop remove 6850514 --json                # remove by product id
 uv run coop recipe recipe.txt --json             # resolve ingredients (read-only)
@@ -108,7 +110,7 @@ Store-specific caveats for exports:
   include units, Coop's `Energie` rows do not.
 - An empty `ingredients` cell usually means a single-ingredient product (milk, flour),
   not a failure.
-- `new-list` works on Coop only; on Migros it exits `2`.
+- `new-list` works on both stores.
 
 `add` and `remove` are idempotent: adding twice does not duplicate, and the JSON
 separates `added` from `already_present`.
@@ -163,7 +165,9 @@ weight. If asked for gram equivalents, say the tool deliberately does not guess.
   the matches, and only then re-run with `--add`. Matching is genuinely fuzzy.
 - **Confirm before writing to the user's account.** `add`, `remove`, `new-list`, `use`
   and `recipe --add` all change real state on their Coop account.
-- **Never delete lists.** Not supported, deliberately.
+- **Deleting a list is permanent and Migros-only.** `coop -s migros delete-list NAME`
+  prompts for confirmation; `--yes` skips it. Never pass `--yes` without the user having
+  asked for that specific list by name. Coop has no delete endpoint at all.
 - **Ordering is out of scope.** Nothing here places an order; checkout stays manual.
 
 ## Latency

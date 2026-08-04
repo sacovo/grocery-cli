@@ -319,12 +319,8 @@ def use(name_or_id: str, as_json: bool = JsonOpt) -> None:
 
 @app.command("new-list")
 def new_list(name: str, as_json: bool = JsonOpt) -> None:
-    """Create a new shopping list. Coop makes the new list active."""
-    if _STORE != "coop":
-        err.print(
-            f"[red]{_STORE} cannot create lists from here; make it in the app.[/]"
-        )
-        raise typer.Exit(Exit.ERROR)
+    """Create a new shopping list. It becomes the active one."""
+    _require("multiple_lists", "creating lists")
     with client() as coop:
         created = coop.create_list(name)
     if as_json:
@@ -333,6 +329,50 @@ def new_list(name: str, as_json: bool = JsonOpt) -> None:
     console.print(
         f"Created [bold]{created.name}[/] ({created.id}) — it is now the active list."
     )
+
+
+@app.command("delete-list")
+def delete_list(
+    name_or_id: str,
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation."),
+    as_json: bool = JsonOpt,
+) -> None:
+    """Delete a shopping list. Permanent - Migros offers no undo.
+
+    Coop has no delete endpoint, so this is Migros-only.
+    """
+    if _STORE != "migros":
+        err.print(
+            f"[red]{_STORE} has no delete endpoint; remove the list in its app.[/]"
+        )
+        raise typer.Exit(Exit.ERROR)
+
+    with client() as store:
+        target = next(
+            (
+                lst
+                for lst in store.get_lists()
+                if lst.id == name_or_id or lst.name.casefold() == name_or_id.casefold()
+            ),
+            None,
+        )
+        if target is None:
+            err.print(f"[red]No list matching {name_or_id!r}.[/]")
+            raise typer.Exit(Exit.NO_RESULTS)
+        count = len(store.get_list()) if target.active else None
+        detail = f" ({count} items)" if count is not None else ""
+        if not yes and not typer.confirm(
+            f"Permanently delete {target.name!r}{detail}? This cannot be undone",
+            default=False,
+        ):
+            err.print("[yellow]Nothing deleted.[/]")
+            raise typer.Exit(Exit.OK)
+        deleted = store.delete_list(target.id)
+
+    if as_json:
+        _emit({"deleted": deleted.as_dict()})
+        return
+    console.print(f"Deleted [bold]{deleted.name}[/].")
 
 
 @app.command()
