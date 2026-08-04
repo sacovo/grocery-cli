@@ -235,6 +235,36 @@ article, which is handy for re-resolving a saved shopping list.
 - **Ordering is deliberately out of scope.** Nothing here places an order; checkout
   stays manual.
 
+## Scripting and agents
+
+Every command takes `--json`, writing machine-readable output to stdout while all
+messages and errors go to stderr — so `coop search … --json | jq` is safe.
+
+```bash
+uv run coop status --json     # {"chrome": true, "logged_in": true, "active_list": {…}}
+uv run coop search Milch --json | jq -r '.products[].id'
+```
+
+Exit codes are meaningful, so callers can branch without parsing messages:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Success |
+| 1 | Ran fine, found nothing (an empty answer, not a failure) |
+| 2 | Invalid request, or Coop behaved unexpectedly |
+| 3 | Not logged in — needs a human at the Chrome window |
+| 4 | DataDome bot wall |
+
+`coop status` is the cheap prerequisite check: run it before a long batch rather than
+discovering halfway through that nobody is logged in. `add` and `remove` are idempotent,
+and their JSON separates `added` from `already_present`.
+
+`--interactive` is rejected when combined with `--json`, since it would block on
+keyboard input.
+
+There is a Claude Code skill at `.claude/skills/coop-shopping/SKILL.md` describing this
+surface, including the latency characteristics and the filter-versus-preference rule.
+
 ## Development
 
 Code quality runs through [qlty](https://qlty.sh) (ruff for lint/format, bandit for

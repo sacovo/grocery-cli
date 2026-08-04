@@ -162,6 +162,15 @@ class Amount:
             number = f"{self.value:g}" if self.value % 1 else f"{int(self.value)}"
         return f"{number} {self.unit}".strip() if self.unit else number
 
+    def as_dict(self) -> dict:
+        return {
+            "value": self.value,
+            "unit": self.unit,
+            "kind": self.kind,
+            "raw": self.raw,
+            "text": str(self),
+        }
+
 
 def _parse_quantity(text: str) -> float | None:
     """Turn "1½", "3/4", "2-3" or "1.5" into a number; ranges yield the upper bound."""
@@ -254,6 +263,21 @@ class Match:
     def is_spoon_scale(self) -> bool:
         """Recipe needs a spoonful or a pinch, so you may already have it in."""
         return self.amount.is_spoon_scale
+
+    def as_dict(self) -> dict:
+        """Plain JSON-serialisable representation."""
+        return {
+            "line": self.line,
+            "term": self.term,
+            "amount": self.amount.as_dict(),
+            "resolved": self.resolved,
+            "spoon_scale": self.is_spoon_scale,
+            "best": self.best.as_dict() if self.best else None,
+            "alternatives": [p.as_dict() for p in self.alternatives],
+            "preference": self.preference,
+            "preference_applied": self.preference_applied,
+            "note": self.note,
+        }
 
     @property
     def resolved(self) -> bool:

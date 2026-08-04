@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import pathlib
 import sys
 
@@ -13,12 +14,37 @@ from .client import CoopClient
 from .filters import SearchFilters, normalise_preference
 from .models import Product
 from .recipes import Match, parse_recipe, resolve
-from .session import CoopError
+from .session import BotWall, CoopError, NotLoggedIn
 
 app = typer.Typer(
     help="Search coop.ch and manage your shopping list.", no_args_is_help=True
 )
+# Human output on stdout, diagnostics on stderr, so `--json` stdout stays parseable.
 console = Console()
+err = Console(stderr=True)
+
+
+class Exit:
+    """Exit codes, so a caller can branch without parsing messages."""
+
+    OK = 0
+    NO_RESULTS = 1
+    """Ran fine, found nothing. Not an error - just an empty answer."""
+    ERROR = 2
+    """Coop behaved unexpectedly, or the request was invalid."""
+    NOT_LOGGED_IN = 3
+    """Needs a human to log in to Supercard in the Chrome window."""
+    BLOCKED = 4
+    """DataDome served its bot-protection page."""
+
+
+JsonOpt = typer.Option(False, "--json", help="Emit JSON on stdout instead of a table.")
+
+
+def _emit(payload: object) -> None:
+    """Write JSON to stdout, unadorned so it can be piped straight into a parser."""
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+
 
 # Shared dietary options, so `search` and `recipe` behave identically.
 VeganOpt = typer.Option(False, "--vegan", help="Only vegan products.")
@@ -61,33 +87,90 @@ def search(
     lactose_free: bool = LactoseOpt,
     gluten_free: bool = GlutenOpt,
     bio: bool = BioOpt,
+    as_json: bool = JsonOpt,
 ) -> None:
     """Search products by free text, optionally filtered."""
     filters = _filters(vegan, vegetarian, lactose_free, gluten_free, bio)
     with CoopClient() as coop:
         hits = coop.search(query, limit=limit, category=category, filters=filters)
+    if as_json:
+        _emit(
+            {
+                "query": query,
+                "count": len(hits),
+                "products": [p.as_dict() for p in hits],
+            }
+        )
+        raise typer.Exit(Exit.OK if hits else Exit.NO_RESULTS)
     if not hits:
-        console.print(f"[yellow]No products found for {query!r} with those filters.[/]")
-        raise typer.Exit(1)
+        err.print(f"[yellow]No products found for {query!r} with those filters.[/]")
+        raise typer.Exit(Exit.NO_RESULTS)
     label = ", ".join(filter(None, [category, _filter_label(filters)]))
     title = f"{len(hits)} results for {query!r}" + (f" [{label}]" if label else "")
     console.print(_products_table(hits, title))
 
 
 @app.command()
-def categories(query: str) -> None:
+def categories(query: str, as_json: bool = JsonOpt) -> None:
     """Show category codes Coop suggests for a search term."""
     with CoopClient() as coop:
         found = coop.suggest_categories(query)
+    if as_json:
+        _emit({"query": query, "categories": found})
+        raise typer.Exit(Exit.OK if found else Exit.NO_RESULTS)
     if not found:
-        console.print(f"[yellow]No categories suggested for {query!r}.[/]")
-        raise typer.Exit(1)
+        err.print(f"[yellow]No categories suggested for {query!r}.[/]")
+        raise typer.Exit(Exit.NO_RESULTS)
     table = Table(title=f"Categories for {query!r}", header_style="bold")
     table.add_column("Code", style="dim", no_wrap=True)
     table.add_column("Name")
     for c in found:
         table.add_row(c["code"], c["name"])
     console.print(table)
+
+
+@app.command()
+def status(as_json: bool = JsonOpt) -> None:
+    """Report whether the tool is ready: Chrome up, logged in, which list is active.
+
+    Cheap prerequisite check - run this before a long batch rather than discovering
+    halfway through that nobody is logged in.
+    """
+    info = _gather_status()
+    if as_json:
+        _emit(info)
+    else:
+        _render_status(info)
+
+    if not info["chrome"]:
+        raise typer.Exit(Exit.ERROR)
+    if not info["logged_in"]:
+        raise typer.Exit(Exit.NOT_LOGGED_IN)
+
+
+def _gather_status() -> dict[str, object]:
+    info: dict[str, object] = {"chrome": False, "logged_in": False, "active_list": None}
+    try:
+        with CoopClient() as coop:
+            info["chrome"] = True
+            coop.session.goto("https://www.coop.ch/de/")
+            info["logged_in"] = coop.session.is_logged_in()
+            if info["logged_in"]:
+                active = next((lst for lst in coop.get_lists() if lst.active), None)
+                info["active_list"] = active.as_dict() if active else None
+    except CoopError as exc:
+        info["error"] = str(exc)
+    return info
+
+
+def _render_status(info: dict[str, object]) -> None:
+    console.print(f"Chrome:      {'up' if info['chrome'] else 'not reachable'}")
+    console.print(f"Logged in:   {'yes' if info['logged_in'] else 'no'}")
+    active_list = info["active_list"]
+    name = active_list["name"] if isinstance(active_list, dict) else "-"
+    console.print(f"Active list: {name}")
+    if info.get("error"):
+        err.print(f"[red]{info['error']}[/]")
 
 
 def _filters(
@@ -112,10 +195,13 @@ def _filter_label(filters: SearchFilters) -> str:
 
 
 @app.command("list")
-def show_list() -> None:
+def show_list(as_json: bool = JsonOpt) -> None:
     """Show the active Coop shopping list."""
     with CoopClient() as coop:
         items = coop.get_list()
+    if as_json:
+        _emit({"count": len(items), "items": [i.as_dict() for i in items]})
+        return
     if not items:
         console.print("[yellow]Shopping list is empty.[/]")
         return
@@ -135,10 +221,13 @@ def show_list() -> None:
 
 
 @app.command()
-def lists() -> None:
+def lists(as_json: bool = JsonOpt) -> None:
     """Show all shopping lists; the active one is marked."""
     with CoopClient() as coop:
         found = coop.get_lists()
+    if as_json:
+        _emit({"count": len(found), "lists": [lst.as_dict() for lst in found]})
+        return
     table = Table(title=f"Shopping lists ({len(found)})", header_style="bold")
     table.add_column("", no_wrap=True)
     table.add_column("Name")
@@ -150,29 +239,39 @@ def lists() -> None:
 
 
 @app.command()
-def use(name_or_id: str) -> None:
+def use(name_or_id: str, as_json: bool = JsonOpt) -> None:
     """Make a shopping list the active one (matched by name or id)."""
     with CoopClient() as coop:
         selected = coop.select_list(name_or_id)
         count = len(coop.get_list())
+    if as_json:
+        _emit({**selected.as_dict(), "item_count": count})
+        return
     console.print(f"Active list is now [bold]{selected.name}[/] ({count} items).")
 
 
 @app.command("new-list")
-def new_list(name: str) -> None:
+def new_list(name: str, as_json: bool = JsonOpt) -> None:
     """Create a new shopping list. Coop makes the new list active."""
     with CoopClient() as coop:
         created = coop.create_list(name)
+    if as_json:
+        _emit(created.as_dict())
+        return
     console.print(
         f"Created [bold]{created.name}[/] ({created.id}) — it is now the active list."
     )
 
 
 @app.command()
-def product(product_id: str) -> None:
+def product(product_id: str, as_json: bool = JsonOpt) -> None:
     """Show a product's details: ingredients, allergens, nutrition."""
     with CoopClient() as coop:
         d = coop.get_product(product_id)
+
+    if as_json:
+        _emit(d.as_dict())
+        return
 
     console.print(
         f"\n[bold]{d.name}[/]" + (f"  [dim]({d.brand})[/]" if d.brand else "")
@@ -214,21 +313,37 @@ def product(product_id: str) -> None:
 
 
 @app.command()
-def add(product_ids: list[str]) -> None:
-    """Add products to the shopping list by ID."""
+def add(product_ids: list[str], as_json: bool = JsonOpt) -> None:
+    """Add products to the shopping list by ID. Idempotent."""
     with CoopClient() as coop:
-        for pid in product_ids:
-            added = coop.add_to_list(pid)
-            console.print(f"  {pid}: {'added' if added else 'already on list'}")
+        results = {pid: coop.add_to_list(pid) for pid in product_ids}
+    if as_json:
+        _emit(
+            {
+                "added": [p for p, new in results.items() if new],
+                "already_present": [p for p, new in results.items() if not new],
+            }
+        )
+        return
+    for pid, new in results.items():
+        console.print(f"  {pid}: {'added' if new else 'already on list'}")
 
 
 @app.command()
-def remove(product_ids: list[str]) -> None:
-    """Remove products from the shopping list by ID."""
+def remove(product_ids: list[str], as_json: bool = JsonOpt) -> None:
+    """Remove products from the shopping list by ID. Idempotent."""
     with CoopClient() as coop:
-        for pid in product_ids:
-            gone = coop.remove_from_list(pid)
-            console.print(f"  {pid}: {'removed' if gone else 'was not on list'}")
+        results = {pid: coop.remove_from_list(pid) for pid in product_ids}
+    if as_json:
+        _emit(
+            {
+                "removed": [p for p, gone in results.items() if gone],
+                "not_on_list": [p for p, gone in results.items() if not gone],
+            }
+        )
+        return
+    for pid, gone in results.items():
+        console.print(f"  {pid}: {'removed' if gone else 'was not on list'}")
 
 
 @app.command()
@@ -257,6 +372,7 @@ def recipe(
         help="Leave out spoon- and pinch-scale ingredients (EL, TL, Prise) — "
         "the staples you probably already have.",
     ),
+    as_json: bool = JsonOpt,
     vegan: bool = VeganOpt,
     vegetarian: bool = VegetarianOpt,
     lactose_free: bool = LactoseOpt,
@@ -271,24 +387,17 @@ def recipe(
     Dietary flags are hard constraints applied to every ingredient - the point when
     cooking for guests. --prefer is only a bias between otherwise acceptable products.
     """
-    text = path.read_text(encoding="utf-8") if path else sys.stdin.read()
-    lines = parse_recipe(text)
-    if not lines:
-        console.print("[yellow]No ingredients found.[/]")
-        raise typer.Exit(1)
+    if interactive and as_json:
+        err.print(
+            "[red]--interactive needs a terminal; it cannot be combined with --json.[/]"
+        )
+        raise typer.Exit(Exit.ERROR)
 
-    try:
-        prefer = normalise_preference(prefer)
-    except ValueError as exc:
-        console.print(f"[red]{exc}[/]")
-        raise typer.Exit(1) from exc
-
+    lines = _read_recipe(path)
+    prefer = _checked_preference(prefer)
     filters = _filters(vegan, vegetarian, lactose_free, gluten_free, bio)
-    banner = ", ".join(
-        filter(None, [_filter_label(filters), f"prefer {prefer}" if prefer else ""])
-    )
-    if banner:
-        console.print(f"[dim]{banner}[/]\n")
+    if not as_json:
+        _print_banner(filters, prefer)
 
     with CoopClient() as coop:
         # Interactive mode shows a menu, so it needs more than the usual few.
@@ -296,16 +405,17 @@ def recipe(
         matches = resolve(
             coop, lines, candidates=wanted, filters=filters, prefer=prefer
         )
+        matches, skipped = _split_pantry(matches, skip_pantry, quiet=as_json)
 
-        if skip_pantry:
-            skipped = [m for m in matches if m.is_spoon_scale]
-            if skipped:
-                names = ", ".join(m.term for m in skipped)
-                console.print(f"[dim]Skipped {len(skipped)} pantry-scale: {names}[/]\n")
-            matches = [m for m in matches if not m.is_spoon_scale]
-            if not matches:
-                console.print("[yellow]Nothing left after skipping pantry items.[/]")
-                return
+        if as_json:
+            _emit_recipe_json(coop, matches, skipped, prefer, add_to_list)
+            raise typer.Exit(
+                Exit.OK if any(m.resolved for m in matches) else Exit.NO_RESULTS
+            )
+
+        if not matches:
+            console.print("[yellow]Nothing left after skipping pantry items.[/]")
+            return
 
         if interactive:
             _run_interactive(coop, matches)
@@ -320,6 +430,67 @@ def recipe(
             )
             return
         _apply_matches(coop, matches)
+
+
+def _read_recipe(path: pathlib.Path | None) -> list[str]:
+    text = path.read_text(encoding="utf-8") if path else sys.stdin.read()
+    lines = parse_recipe(text)
+    if not lines:
+        err.print("[yellow]No ingredients found.[/]")
+        raise typer.Exit(Exit.NO_RESULTS)
+    return lines
+
+
+def _checked_preference(prefer: str | None) -> str | None:
+    try:
+        return normalise_preference(prefer)
+    except ValueError as exc:
+        err.print(f"[red]{exc}[/]")
+        raise typer.Exit(Exit.ERROR) from exc
+
+
+def _print_banner(filters: SearchFilters, prefer: str | None) -> None:
+    banner = ", ".join(
+        filter(None, [_filter_label(filters), f"prefer {prefer}" if prefer else ""])
+    )
+    if banner:
+        console.print(f"[dim]{banner}[/]\n")
+
+
+def _split_pantry(
+    matches: list[Match], skip_pantry: bool, *, quiet: bool
+) -> tuple[list[Match], list[Match]]:
+    """Partition off spoon-scale ingredients when the caller asked to skip them."""
+    if not skip_pantry:
+        return matches, []
+    skipped = [m for m in matches if m.is_spoon_scale]
+    kept = [m for m in matches if not m.is_spoon_scale]
+    if skipped and not quiet:
+        names = ", ".join(m.term for m in skipped)
+        console.print(f"[dim]Skipped {len(skipped)} pantry-scale: {names}[/]\n")
+    return kept, skipped
+
+
+def _emit_recipe_json(
+    coop: CoopClient,
+    matches: list[Match],
+    skipped: list[Match],
+    prefer: str | None,
+    add_to_list: bool,
+) -> None:
+    """Emit the resolution result, writing to the list first when asked to."""
+    written = coop.add_many([m.best for m in matches if m.best]) if add_to_list else {}
+    _emit(
+        {
+            "prefer": prefer,
+            "added_to_list": add_to_list,
+            "matches": [m.as_dict() for m in matches],
+            "skipped_pantry": [m.as_dict() for m in skipped],
+            "unresolved": [m.term for m in matches if not m.resolved],
+            "added": [pid for pid, new in written.items() if new],
+            "already_present": [pid for pid, new in written.items() if not new],
+        }
+    )
 
 
 def _run_interactive(coop: CoopClient, matches: list[Match]) -> None:
@@ -464,11 +635,21 @@ def _apply_matches(coop: CoopClient, matches: list[Match]) -> None:
 
 
 def main() -> None:
+    """Entry point. Maps failures onto the exit codes documented in `Exit`."""
     try:
         app()
+    except NotLoggedIn as exc:
+        err.print(f"[red]{exc}[/]")
+        raise typer.Exit(Exit.NOT_LOGGED_IN) from exc
+    except BotWall as exc:
+        err.print(f"[red]{exc}[/]")
+        raise typer.Exit(Exit.BLOCKED) from exc
     except CoopError as exc:
-        console.print(f"[red]{exc}[/]")
-        raise typer.Exit(2) from exc
+        err.print(f"[red]{exc}[/]")
+        raise typer.Exit(Exit.ERROR) from exc
+    except KeyboardInterrupt:
+        err.print("[yellow]Interrupted.[/]")
+        raise typer.Exit(Exit.ERROR) from None
 
 
 if __name__ == "__main__":

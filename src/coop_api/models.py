@@ -35,6 +35,21 @@ class Product:
             return None
         return f"https://www.coop.ch{self.url}"
 
+    def as_dict(self) -> dict:
+        """Plain JSON-serialisable representation."""
+        return {
+            "id": self.id,
+            "name": self.name,
+            "brand": self.brand,
+            "price": self.price,
+            "quantity": self.quantity,
+            "unit_price": self.unit_price,
+            "orderable": self.orderable,
+            "in_stock": self.in_stock,
+            "rating_count": self.rating_count,
+            "url": self.full_url,
+        }
+
     def __str__(self) -> str:
         price = f"CHF {self.price:.2f}" if self.price is not None else "n/a"
         qty = f" ({self.quantity})" if self.quantity else ""
@@ -56,6 +71,15 @@ class ListItem:
         price = f"CHF {self.price:.2f}" if self.price is not None else "n/a"
         return f"{self.quantity}x [{self.product_id}] {self.name} - {price}"
 
+    def as_dict(self) -> dict:
+        return {
+            "product_id": self.product_id,
+            "entry_id": self.entry_id,
+            "name": self.name,
+            "quantity": self.quantity,
+            "price": self.price,
+        }
+
 
 @dataclasses.dataclass(slots=True)
 class ShoppingList:
@@ -67,6 +91,9 @@ class ShoppingList:
 
     def __str__(self) -> str:
         return f"{'* ' if self.active else '  '}{self.name}  [{self.id}]"
+
+    def as_dict(self) -> dict:
+        return {"id": self.id, "name": self.name, "active": self.active}
 
 
 @dataclasses.dataclass(slots=True)
@@ -97,6 +124,25 @@ class ProductDetail:
     def __str__(self) -> str:
         price = f"CHF {self.price:.2f}" if self.price is not None else "n/a"
         return f"[{self.id}] {self.name} - {price}"
+
+    def as_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "brand": self.brand,
+            "price": self.price,
+            "gtin": self.gtin,
+            "description": self.description,
+            "ingredients": self.ingredients,
+            "allergens": list(self.allergens),
+            "origin": self.origin,
+            "production_country": self.production_country,
+            "storage": self.storage,
+            "nutrition": [{"label": k, "value": v} for k, v in self.nutrition],
+            "nutrition_base": self.nutrition_base,
+            "info": dict(self.info),
+            "url": f"https://www.coop.ch{self.url}" if self.url else None,
+        }
 
 
 _NUM = re.compile(r"\d+(?:[.,]\d+)?")
