@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import re
 import urllib.parse
 
@@ -295,6 +296,24 @@ class CoopClient:
                 f"Tried to select list {target.name!r} but it did not become active."
             )
         return ShoppingList(id=target.id, name=target.name, active=True)
+
+    @contextlib.contextmanager
+    def using_list(self, name_or_id: str | None):
+        """Temporarily make a list active, restoring the previous one afterwards.
+
+        Reading a non-active list means switching to it, which is a write to the user's
+        account. Anything read-only should leave the active list as it found it.
+        """
+        if not name_or_id:
+            yield
+            return
+        previous = next((lst for lst in self.get_lists() if lst.active), None)
+        self.select_list(name_or_id)
+        try:
+            yield
+        finally:
+            if previous is not None and self.active_list_id() != previous.id:
+                self.select_list(previous.id)
 
     def create_list(self, name: str) -> ShoppingList:
         """Create a new shopping list.

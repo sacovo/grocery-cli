@@ -235,6 +235,45 @@ article, which is handy for re-resolving a saved shopping list.
 - **Ordering is deliberately out of scope.** Nothing here places an order; checkout
   stays manual.
 
+## Exports
+
+For feeding a spreadsheet or an inventory system. CSV by default, `--format json` for
+full fidelity, `-o FILE` to write to disk (progress then goes to stderr).
+
+```bash
+uv run coop export list                              # active list, CSV to stdout
+uv run coop export list --list "Grillabend" -o l.csv # a specific list
+uv run coop export products 6850514 7362485 -o p.csv # named products
+uv run coop export products --from-list -o p.csv     # every product on the list
+```
+
+**List export** — one row per entry, with a computed line total:
+
+```csv
+product_id,name,quantity,price,line_total,entry_id
+6139128,Thai Kitchen Kokosnussmilch,13,7.5,97.5,12B36FC4-…
+```
+
+**Product export** — the scalar fields (`id`, `name`, `brand`, `price`, `gtin`,
+`ingredients`, `allergens`, `origin`, `production_country`, `storage`, `description`,
+`url`, `nutrition_base`), then dynamic columns for everything that varies per product:
+
+- `nutrition:Fett`, `nutrition:Kohlenhydrate`, … one per nutrient. Coop prints two rows
+  both labelled `Energie` (kJ then kcal) with no unit on either, so the second becomes
+  `nutrition:Energie (2)` rather than being silently dropped.
+- `info:Lagerung`, `info:Artikelnummer`, `info:ECO-SCORE®`, … whatever extra sections
+  the product page carries.
+
+Columns are the union across the exported products, so a field only one product has
+still gets a column, empty for the rest.
+
+Both exports are **read-only**. `--list` switches to that list and switches back, so
+exporting never leaves a different list active.
+
+`export products` costs one page load per product — a 110-item list takes minutes.
+Progress is reported on stderr so stdout stays pipeable, and a product that fails to
+load is skipped with a warning rather than aborting the run.
+
 ## Scripting and agents
 
 Every command takes `--json`, writing machine-readable output to stdout while all

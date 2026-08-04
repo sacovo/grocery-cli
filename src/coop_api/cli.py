@@ -11,6 +11,7 @@ from rich.console import Console
 from rich.table import Table
 
 from .client import CoopClient
+from .export import list_rows, product_rows, write_csv
 from .filters import SearchFilters, normalise_preference
 from .models import Product
 from .recipes import Match, parse_recipe, resolve
@@ -344,6 +345,110 @@ def remove(product_ids: list[str], as_json: bool = JsonOpt) -> None:
         return
     for pid, gone in results.items():
         console.print(f"  {pid}: {'removed' if gone else 'was not on list'}")
+
+
+export_app = typer.Typer(
+    help="Export data for other systems (inventory, spreadsheets).",
+    no_args_is_help=True,
+)
+app.add_typer(export_app, name="export")
+
+FormatOpt = typer.Option("csv", "--format", "-f", help="csv or json.")
+OutputOpt = typer.Option(
+    None, "--output", "-o", help="Write to a file instead of stdout."
+)
+
+
+def _write_export(
+    columns: list[str],
+    rows: list[dict],
+    fmt: str,
+    output: pathlib.Path | None,
+) -> None:
+    """Render rows as CSV or JSON, to a file or stdout."""
+    fmt = fmt.lower()
+    if fmt not in ("csv", "json"):
+        err.print(f"[red]Unknown format {fmt!r}. Use csv or json.[/]")
+        raise typer.Exit(Exit.ERROR)
+
+    if output:
+        with output.open("w", encoding="utf-8", newline="") as stream:
+            if fmt == "csv":
+                write_csv(columns, rows, stream)
+            else:
+                json.dump(rows, stream, ensure_ascii=False, indent=2)
+                stream.write("\n")
+        err.print(f"[green]Wrote {len(rows)} rows to {output}[/]")
+        return
+
+    if fmt == "csv":
+        write_csv(columns, rows, sys.stdout)
+    else:
+        _emit(rows)
+
+
+@export_app.command("list")
+def export_list(
+    name_or_id: str = typer.Option(
+        None, "--list", help="Which list to export. Defaults to the active one."
+    ),
+    fmt: str = FormatOpt,
+    output: pathlib.Path = OutputOpt,
+) -> None:
+    """Export a shopping list with quantities, prices and line totals.
+
+    Read-only: exporting a non-active list switches to it and switches back.
+    """
+    with CoopClient() as coop, coop.using_list(name_or_id):
+        items = coop.get_list()
+    columns, rows = list_rows(items)
+    _write_export(columns, rows, fmt, output)
+
+
+@export_app.command("products")
+def export_products(
+    product_ids: list[str] = typer.Argument(
+        None, help="Product ids. Omit and use --from-list to take them from a list."
+    ),
+    from_list: bool = typer.Option(
+        False, "--from-list", help="Export every product on the shopping list."
+    ),
+    name_or_id: str = typer.Option(
+        None, "--list", help="With --from-list: which list. Defaults to the active one."
+    ),
+    fmt: str = FormatOpt,
+    output: pathlib.Path = OutputOpt,
+) -> None:
+    """Export full product details: ingredients, allergens, storage, nutrition.
+
+    One page load per product, so exporting a long list takes minutes. Progress is
+    reported on stderr, leaving stdout clean to pipe.
+    """
+    if not product_ids and not from_list:
+        err.print("[red]Give product ids, or --from-list to take them from a list.[/]")
+        raise typer.Exit(Exit.ERROR)
+
+    with CoopClient() as coop:
+        if from_list:
+            with coop.using_list(name_or_id):
+                product_ids = [item.product_id for item in coop.get_list()]
+            err.print(f"[dim]Fetching details for {len(product_ids)} products…[/]")
+
+        details = []
+        for index, pid in enumerate(product_ids, start=1):
+            try:
+                details.append(coop.get_product(pid))
+            except CoopError as exc:
+                err.print(f"[yellow]  {pid}: skipped ({exc})[/]")
+                continue
+            if index % 10 == 0 or index == len(product_ids):
+                err.print(f"[dim]  {index}/{len(product_ids)}[/]")
+
+    if not details:
+        err.print("[yellow]Nothing exported.[/]")
+        raise typer.Exit(Exit.NO_RESULTS)
+    columns, rows = product_rows(details)
+    _write_export(columns, rows, fmt, output)
 
 
 @app.command()

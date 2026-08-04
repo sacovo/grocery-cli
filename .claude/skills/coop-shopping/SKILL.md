@@ -59,6 +59,28 @@ uv run coop recipe recipe.txt --json             # resolve ingredients (read-onl
 uv run coop recipe recipe.txt --json --add       # …and write them to the list
 ```
 
+## Exports
+
+For handing data to a spreadsheet or an inventory system. CSV by default,
+`--format json` for full fidelity, `-o FILE` to write to disk.
+
+```bash
+uv run coop export list                               # active list -> CSV on stdout
+uv run coop export list --list "Grillabend" -o l.csv  # a named list
+uv run coop export products 6850514 7362485 -o p.csv  # named products
+uv run coop export products --from-list -o p.csv      # every product on the list
+```
+
+- **List export** columns: `product_id, name, quantity, price, line_total, entry_id`.
+- **Product export** carries `ingredients`, `allergens`, `storage`, `origin`, `gtin` and
+  friends, plus dynamic `nutrition:*` and `info:*` columns unioned across the products.
+
+Both are read-only — `--list` switches to that list and switches back.
+
+`export products --from-list` is **one page load per product**: a 110-item list takes
+several minutes. Prefer explicit ids when the user only needs a few, warn before running
+the full-list variant, and set a long timeout.
+
 `add` and `remove` are idempotent: adding twice does not duplicate, and the JSON
 separates `added` from `already_present`.
 
