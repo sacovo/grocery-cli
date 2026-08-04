@@ -5,10 +5,10 @@ from __future__ import annotations
 import dataclasses
 import re
 
-from .client import CoopClient
-from .filters import PREFERENCES, SearchFilters, normalise_preference
+from .errors import GroceryError
 from .models import Product
-from .session import CoopError
+from .stores.coop.client import CoopClient
+from .stores.coop.filters import PREFERENCES, SearchFilters, normalise_preference
 
 # How a unit relates to what you can actually buy:
 #   "weight"/"volume" - the amount tells you which pack size to pick.
@@ -344,7 +344,7 @@ def _resolve_line(
         return Match(line=line, term=term, best=None, amount=amount)
     try:
         hits, applied = _search_preferring(coop, term, candidates, filters, prefer)
-    except CoopError as exc:
+    except GroceryError as exc:
         return Match(
             line=line,
             term=term,
@@ -390,7 +390,7 @@ def _search_preferring(
             hits = coop.search(term, limit=limit, filters=base.with_facet(facet))
             if hits:
                 return hits, True
-        except CoopError:
+        except GroceryError:
             # Coop only lists facets with at least one hit, so an absent facet simply
             # means "nothing here matches the preference" - not an error worth raising.
             pass

@@ -10,12 +10,12 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from .client import CoopClient
+from .errors import BotWall, GroceryError, NotLoggedIn
 from .export import list_rows, product_rows, write_csv
-from .filters import SearchFilters, normalise_preference
 from .models import Product
 from .recipes import Match, parse_recipe, resolve
-from .session import BotWall, CoopError, NotLoggedIn
+from .stores.coop.client import CoopClient
+from .stores.coop.filters import SearchFilters, normalise_preference
 
 app = typer.Typer(
     help="Search coop.ch and manage your shopping list.", no_args_is_help=True
@@ -159,7 +159,7 @@ def _gather_status() -> dict[str, object]:
             if info["logged_in"]:
                 active = next((lst for lst in coop.get_lists() if lst.active), None)
                 info["active_list"] = active.as_dict() if active else None
-    except CoopError as exc:
+    except GroceryError as exc:
         info["error"] = str(exc)
     return info
 
@@ -438,7 +438,7 @@ def export_products(
         for index, pid in enumerate(product_ids, start=1):
             try:
                 details.append(coop.get_product(pid))
-            except CoopError as exc:
+            except GroceryError as exc:
                 err.print(f"[yellow]  {pid}: skipped ({exc})[/]")
                 continue
             if index % 10 == 0 or index == len(product_ids):
@@ -749,7 +749,7 @@ def main() -> None:
     except BotWall as exc:
         err.print(f"[red]{exc}[/]")
         raise typer.Exit(Exit.BLOCKED) from exc
-    except CoopError as exc:
+    except GroceryError as exc:
         err.print(f"[red]{exc}[/]")
         raise typer.Exit(Exit.ERROR) from exc
     except KeyboardInterrupt:

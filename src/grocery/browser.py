@@ -1,9 +1,10 @@
-"""Browser session management.
+"""Shared browser session: a real Chrome, attached over its debug port.
 
-coop.ch is protected by DataDome, which rejects browsers started with Playwright's
-automation flags. So we do not let Playwright launch anything: we start an ordinary
-Chrome ourselves and attach to its debug port. That is a genuine browser running the
-user's own logged-in session - no fingerprint spoofing involved.
+Store-agnostic. Two independent reasons the stores need a genuine browser rather than
+an HTTP client: coop.ch is behind DataDome, which rejects browsers started with
+Playwright's automation flags; and migros.ch issues an OAuth bearer token that only a
+logged-in browser session obtains. So Playwright launches nothing - we start an ordinary
+Chrome ourselves and attach to it. No fingerprint spoofing is involved.
 """
 
 from __future__ import annotations
@@ -19,27 +20,21 @@ import urllib.request
 from playwright.sync_api import Browser, Page, sync_playwright
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
-from . import extractors as js
+from .errors import BotWall, GroceryError
 
 log = logging.getLogger(__name__)
 
 DEFAULT_PORT = 9222
-DEFAULT_PROFILE = pathlib.Path.home() / ".coop-api" / "chrome-profile"
+_LEGACY_PROFILE = pathlib.Path.home() / ".coop-api" / "chrome-profile"
+_PROFILE = pathlib.Path.home() / ".grocery" / "chrome-profile"
+
+# The package used to be called coop-api. Keep using the old profile if it is the one
+# that exists: it holds the store logins, and silently starting a fresh profile would
+# look like "you have been logged out of everything" for no visible reason.
+DEFAULT_PROFILE = (
+    _LEGACY_PROFILE if _LEGACY_PROFILE.exists() and not _PROFILE.exists() else _PROFILE
+)
 CHROME_CANDIDATES = ("google-chrome-stable", "google-chrome", "chromium", "chrome")
-
-BASE = "https://www.coop.ch"
-
-
-class CoopError(RuntimeError):
-    pass
-
-
-class NotLoggedIn(CoopError):
-    pass
-
-
-class BotWall(CoopError):
-    """coop.ch served the DataDome interstitial instead of real content."""
 
 
 def _port_open(port: int, host: str = "127.0.0.1") -> bool:
@@ -66,7 +61,7 @@ def find_chrome() -> str:
         path = shutil.which(name)
         if path:
             return path
-    raise CoopError(
+    raise GroceryError(
         "No Chrome/Chromium binary found. Install Chrome, or pass chrome_path=... explicitly."
     )
 
@@ -86,7 +81,7 @@ def launch_chrome(
     if _debug_ready(port):
         return None
     if _port_open(port):
-        raise CoopError(f"Port {port} is in use but is not a Chrome debug endpoint.")
+        raise GroceryError(f"Port {port} is in use but is not a Chrome debug endpoint.")
 
     profile.mkdir(parents=True, exist_ok=True)
     argv = [
@@ -95,7 +90,6 @@ def launch_chrome(
         f"--user-data-dir={profile}",
         "--no-first-run",
         "--no-default-browser-check",
-        BASE,
     ]
     # No shell, fixed argument list, and the executable is either resolved from a
     # known-name allowlist via shutil.which or supplied explicitly by the caller.
@@ -109,13 +103,13 @@ def launch_chrome(
         if _debug_ready(port):
             return proc
         if proc.poll() is not None:
-            raise CoopError("Chrome exited before the debug port became available.")
+            raise GroceryError("Chrome exited before the debug port became available.")
         time.sleep(0.3)
-    raise CoopError(f"Chrome debug port {port} did not come up within {timeout:g}s.")
+    raise GroceryError(f"Chrome debug port {port} did not come up within {timeout:g}s.")
 
 
-class CoopSession:
-    """Attaches to a running Chrome and hands out a page pointed at coop.ch."""
+class BrowserSession:
+    """Attaches to a running Chrome and hands out a page to drive."""
 
     def __init__(
         self,
@@ -134,16 +128,16 @@ class CoopSession:
         self._proc: subprocess.Popen | None = None
         self._owns_chrome = False
 
-    def __enter__(self) -> CoopSession:
+    def __enter__(self) -> BrowserSession:
         return self.start()
 
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    def start(self) -> CoopSession:
+    def start(self) -> BrowserSession:
         if not _debug_ready(self.port):
             if not self.autostart:
-                raise CoopError(
+                raise GroceryError(
                     f"No Chrome debug endpoint on port {self.port}. Start Chrome with "
                     f"--remote-debugging-port={self.port}, or use autostart=True."
                 )
@@ -155,7 +149,7 @@ class CoopSession:
             f"http://127.0.0.1:{self.port}"
         )
         if not self._browser.contexts:
-            raise CoopError("Chrome exposed no browser context.")
+            raise GroceryError("Chrome exposed no browser context.")
         ctx = self._browser.contexts[0]
         self._page = ctx.pages[0] if ctx.pages else ctx.new_page()
         return self
@@ -163,41 +157,42 @@ class CoopSession:
     @property
     def page(self) -> Page:
         if self._page is None:
-            raise CoopError("Session not started - use `with CoopSession() as s:`.")
+            raise GroceryError(
+                "Session not started - use `with BrowserSession() as s:`."
+            )
         return self._page
+
+    def is_blocked(self) -> bool:
+        """True if a bot-protection interstitial was served instead of the page.
+
+        Detects DataDome, which fronts coop.ch. Migros never trips it, so the check is
+        simply always false there - cheap enough to run for every navigation.
+        """
+        return bool(
+            self.page.evaluate(
+                "() => !!document.querySelector('script[src*=\"captcha-delivery\"]')"
+            )
+        )
 
     def goto(
         self, url: str, *, wait_for: str | None = None, timeout: float = 30000
     ) -> None:
-        """Navigate and fail loudly if DataDome intercepted the request."""
+        """Navigate, failing loudly if bot protection intercepted the request."""
         self.page.goto(url, wait_until="domcontentloaded", timeout=timeout)
         if self.is_blocked():
             raise BotWall(
-                "coop.ch served its bot-protection page. Interact with the Chrome window "
+                f"{url} served a bot-protection page. Interact with the Chrome window "
                 "once (scroll/click) to re-establish the session, then retry."
             )
         if wait_for:
             try:
                 self.page.wait_for_selector(wait_for, timeout=timeout)
             except PlaywrightTimeoutError as exc:
-                # Surface as a CoopError so callers never have to catch Playwright's
+                # Surface as a GroceryError so callers never have to catch Playwright's
                 # exceptions to tell "this page is not what we expected" from a crash.
-                raise CoopError(
+                raise GroceryError(
                     f"{url} did not render {wait_for!r} within {timeout / 1000:g}s."
                 ) from exc
-
-    def is_blocked(self) -> bool:
-        return bool(self.page.evaluate(js.IS_BLOCKED))
-
-    def is_logged_in(self) -> bool:
-        return bool(self.page.evaluate(js.IS_LOGGED_IN))
-
-    def require_login(self) -> None:
-        if not self.is_logged_in():
-            raise NotLoggedIn(
-                "Not logged in to coop.ch. Log in via Supercard in the Chrome window that "
-                "this tool opened (the session then persists in its profile), and retry."
-            )
 
     def close(self) -> None:
         """Detach. Chrome keeps running unless we started it ourselves.

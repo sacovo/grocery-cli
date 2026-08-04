@@ -8,10 +8,12 @@ import urllib.parse
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
+from ...errors import GroceryError
+from ...models import ListItem, Product, ProductDetail, ShoppingList, parse_price
+from ..base import Capabilities
 from . import extractors as js
 from .filters import SearchFilters
-from .models import ListItem, Product, ProductDetail, ShoppingList, parse_price
-from .session import BASE, CoopError, CoopSession
+from .session import BASE, CoopSession
 
 # Opens the "Alle Listen" modal, the entry point for both selecting and creating.
 _LIST_CHOOSER_TRIGGER = (
@@ -29,6 +31,15 @@ class CoopClient:
             hits = coop.search("Milch 3.5%")
             coop.add_to_list(hits[0])
     """
+
+    name = "coop"
+    capabilities = Capabilities(
+        lists=True,
+        multiple_lists=True,
+        dietary_filters=True,
+        categories=True,
+        product_details=True,
+    )
 
     def __init__(
         self, session: CoopSession | None = None, locale: str = "de", **kwargs
@@ -157,7 +168,7 @@ class CoopClient:
             before = page.evaluate(js.RESULT_COUNT)
             clicked = page.evaluate(js.TICK_FACET, checkbox_id)
             if not clicked:
-                raise CoopError(
+                raise GroceryError(
                     f"Filter {checkbox_id!r} is not offered for this search. Coop only lists "
                     "facets that match at least one result - try a broader query."
                 )
@@ -292,7 +303,7 @@ class CoopClient:
 
         self._session.goto(f"{BASE}/{self.locale}/shopping-list")
         if self.active_list_id() != target.id:
-            raise CoopError(
+            raise GroceryError(
                 f"Tried to select list {target.name!r} but it did not become active."
             )
         return ShoppingList(id=target.id, name=target.name, active=True)
@@ -326,7 +337,7 @@ class CoopClient:
             raise ValueError("List name must not be empty.")
         existing = self.get_lists()
         if any(lst.name.casefold() == name.casefold() for lst in existing):
-            raise CoopError(f"A list named {name!r} already exists.")
+            raise GroceryError(f"A list named {name!r} already exists.")
 
         page = self._session.page
         self._open_list_chooser()
@@ -344,7 +355,7 @@ class CoopClient:
         for lst in self.get_lists():
             if lst.name.casefold() == name.casefold():
                 return lst
-        raise CoopError(
+        raise GroceryError(
             f"Created list {name!r} but it did not show up in the list overview."
         )
 
@@ -362,11 +373,11 @@ class CoopClient:
         if len(matches) == 1:
             return matches[0]
         if len(matches) > 1:
-            raise CoopError(
+            raise GroceryError(
                 f"{name_or_id!r} matches several lists: {[m.name for m in matches]}. "
                 "Be more specific."
             )
-        raise CoopError(
+        raise GroceryError(
             f"No shopping list matching {name_or_id!r}. Available: {[lst.name for lst in lists]}"
         )
 
@@ -409,7 +420,7 @@ class CoopClient:
         try:
             page.wait_for_selector('[data-testauto="tab-shoppinglist"]', timeout=10000)
         except PlaywrightTimeoutError:
-            raise CoopError(
+            raise GroceryError(
                 "The shopping list did not render within "
                 f"{timeout / 1000:g}s. Refusing to report it as empty, since that would "
                 "make add_to_list duplicate products already on the list."
@@ -433,7 +444,7 @@ class CoopClient:
             return False
         self._click_add(product_id)
         if not any(item.product_id == product_id for item in self.get_list()):
-            raise CoopError(
+            raise GroceryError(
                 f"Clicked the shopping-list control for {product_id} but it did not appear "
                 "on the list. Coop may have changed the flow."
             )
@@ -449,7 +460,9 @@ class CoopClient:
         if not button.count():
             button = self._session.page.locator("[data-shopping-list-toggle]").first
         if not button.count():
-            raise CoopError(f"No shopping-list control found for product {product_id}.")
+            raise GroceryError(
+                f"No shopping-list control found for product {product_id}."
+            )
         button.click()
         self._session.page.wait_for_timeout(2000)
 
@@ -467,14 +480,14 @@ class CoopClient:
             f'li.shoppingList__item[data-productid="{product_id}"] [data-shopping-list-item-remove]'
         ).first
         if not delete_icon.count():
-            raise CoopError(
+            raise GroceryError(
                 f"No delete control found on the list row for {product_id}."
             )
         delete_icon.click()
         self._session.page.wait_for_timeout(2500)
 
         if any(item.product_id == product_id for item in self.get_list()):
-            raise CoopError(
+            raise GroceryError(
                 f"Clicked the shopping-list control for {product_id} but it is still on "
                 "the list. Coop may have changed the flow."
             )
@@ -503,7 +516,7 @@ class CoopClient:
             final = {item.product_id for item in self.get_list()}
             missing = [pid for pid in added if pid not in final]
             if missing:
-                raise CoopError(
+                raise GroceryError(
                     f"These products were clicked but did not reach the list: {missing}. "
                     "Coop may have changed the flow."
                 )

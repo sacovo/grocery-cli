@@ -9,6 +9,6 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4", "RUF"]
 
 [lint.per-file-ignores]
 # Mostly long JavaScript string literals; wrapping them hurts readability.
-"src/coop_api/extractors.py" = ["E501"]
+"src/grocery/stores/coop/extractors.py" = ["E501"]
 # typer.Option/Argument in a default is the framework's intended usage.
-"src/coop_api/cli.py" = ["B008"]
+"src/grocery/cli.py" = ["B008"]
