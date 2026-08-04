@@ -1,0 +1,597 @@
+"""High-level coop.ch client: search products, put them on a shopping list."""
+
+from __future__ import annotations
+
+import dataclasses
+import re
+import urllib.parse
+
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+from .filters import SearchFilters
+from .models import ListItem, Product, ProductDetail, ShoppingList, parse_price
+from .session import BASE, CoopError, CoopSession
+
+# Category refinements offered alongside a set of results ("Reibkäse", "Frische Milch").
+# Scoped to the result navigation - a bare a[href*="/c/m_"] also matches the global
+# header and footer menus, which have nothing to do with the query.
+_EXTRACT_CATEGORIES = """
+() => [...document.querySelectorAll('.productListNavigation__item a[href*="/c/m_"]')].map(a => {
+    const m = (a.getAttribute('href') || '').match(/\\/c\\/(m_[0-9a-z]+)/);
+    const name = a.textContent.trim().replace(/\\s+/g, ' ');
+    return m && name ? {code: m[1], name} : null;
+}).filter(Boolean)
+"""
+
+# Product detail page: labelled sections, highlighted allergens, nutrition rows.
+_EXTRACT_PRODUCT = """
+() => {
+    const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+
+    const sections = {};
+    document.querySelectorAll('.productInformation__title').forEach(h => {
+        const body = h.nextElementSibling;
+        if (body) sections[norm(h.textContent)] = norm(body.textContent);
+    });
+
+    // Coop marks allergens by bolding them inside the ingredient list.
+    let allergens = [];
+    document.querySelectorAll('.productInformation__title').forEach(h => {
+        if (/^Zutaten/i.test(norm(h.textContent)) && h.nextElementSibling) {
+            allergens = [...h.nextElementSibling.querySelectorAll('b, strong')]
+                .map(b => norm(b.textContent)).filter(Boolean);
+        }
+    });
+
+    const nutrition = [...document.querySelectorAll('[data-testauto="nutrition-row"]')].map(li => {
+        const label = li.querySelector('.list--dotted-item__label-text');
+        const amount = li.querySelector('.list--dotted-item__amount');
+        return [norm(label ? label.textContent : ''), norm(amount ? amount.textContent : '')];
+    }).filter(pair => pair[0]);
+
+    const base = document.querySelector('[data-testauto="productnutritionbaseamount"]');
+
+    let ld = null;
+    document.querySelectorAll('script[type="application/ld+json"]').forEach(s => {
+        try {
+            const parsed = JSON.parse(s.textContent);
+            if (parsed && parsed['@type'] === 'Product') ld = parsed;
+        } catch (e) { /* breadcrumb blocks are not always valid on their own */ }
+    });
+
+    return {
+        sections,
+        allergens,
+        nutrition,
+        nutritionBase: base ? norm(base.textContent) : null,
+        ld,
+        name: norm((document.querySelector('h1') || {}).textContent),
+        url: location.pathname,
+    };
+}
+"""
+
+# The list chooser modal is the only place that enumerates every list.
+_EXTRACT_LISTS = """
+(html) => {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    return [...doc.querySelectorAll('[data-shopping-list-id]')].map(e => ({
+        id: e.getAttribute('data-shopping-list-id'),
+        name: (e.textContent || '').replace(/\\s+/g, ' ').trim(),
+    })).filter(l => l.id);
+}
+"""
+
+_RESULT_COUNT = """
+() => {
+    const m = document.body.innerText.match(/Es stehen\\s+([\\d'\\u2019]+)\\s+Produkte/);
+    return m ? m[1].replace(/['\\u2019]/g, '') : null;
+}
+"""
+
+# Extracts one dict per product tile on a listing page. Kept in one place because the
+# tile markup is the single thing most likely to break when Coop redesigns.
+_EXTRACT_TILES = """
+() => {
+    // Scoped to the result lister on purpose. A page with no matches still renders
+    // recommendation carousels (.productCarouselIsolated__item) full of unrelated
+    // products - reading those as results turns "no vegan bacon" into "Heinz burger
+    // sauce", which is exactly the kind of wrong answer a dietary filter must not give.
+    const tiles = document.querySelectorAll('.list-page__content [data-producttile-wrapper]');
+    return [...tiles].map(t => {
+        const link = t.querySelector('a[data-productid]');
+        const pick = sel => { const e = t.querySelector(sel); return e ? e.textContent.trim() : null; };
+        const unitLabel = [...t.querySelectorAll('.productTile__price-label')]
+            .find(e => /Preis pro/i.test(e.textContent || ''));
+        let unitPrice = null;
+        if (unitLabel && unitLabel.nextElementSibling) {
+            unitPrice = unitLabel.nextElementSibling.textContent.trim().replace(/\\s+/g, '');
+        }
+        const priceEl = t.querySelector('[data-udo-price]');
+        const ratingTxt = pick('.rating__amount');
+        return {
+            id: link ? link.getAttribute('data-productid') : null,
+            name: pick('.productTile-details__name-value'),
+            brand: pick('[data-udo-brand]'),
+            price: priceEl ? priceEl.getAttribute('data-udo-price') : pick('.productTile__price-value-lead-price'),
+            quantity: pick('.productTile__quantity-text'),
+            unitPrice: unitPrice,
+            url: link ? (link.getAttribute('href') || '').split('?')[0] : null,
+            inStock: !!t.querySelector('link[href*="InStock"]'),
+            orderable: !!t.querySelector('button[title*="Warenkorb" i], button[aria-label*="Warenkorb" i]'),
+            ratingCount: ratingTxt ? ratingTxt.replace(/[^0-9]/g, '') : null,
+        };
+    }).filter(p => p.id && p.name);
+}
+"""
+
+# One entry per row of the active shopping list.
+_EXTRACT_LIST = """
+() => [...document.querySelectorAll('li.shoppingList__item')].map(li => {
+    const qty = li.querySelector('.shoppingList__description');
+    const price = li.querySelector('[data-udo-price]');
+    return {
+        productId: li.getAttribute('data-productid'),
+        entryId: li.getAttribute('data-shoppinglist--entry-id'),
+        name: (li.getAttribute('aria-label') || '').trim(),
+        quantity: qty ? qty.textContent.trim() : null,
+        price: price ? price.getAttribute('data-udo-price') : null,
+    };
+}).filter(i => i.productId && i.entryId)
+"""
+
+
+class CoopClient:
+    """Search coop.ch and manage the shopping list.
+
+    Usage::
+
+        with CoopClient() as coop:
+            hits = coop.search("Milch 3.5%")
+            coop.add_to_list(hits[0])
+    """
+
+    def __init__(self, session: CoopSession | None = None, locale: str = "de", **kwargs) -> None:
+        self.locale = locale
+        self._session = session or CoopSession(**kwargs)
+        self._owns_session = session is None
+
+    def __enter__(self) -> CoopClient:
+        self._session.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if self._owns_session:
+            self._session.close()
+
+    @property
+    def session(self) -> CoopSession:
+        return self._session
+
+    # -- reading ----------------------------------------------------------------
+
+    def search(
+        self,
+        query: str,
+        limit: int = 30,
+        category: str | None = None,
+        filters: SearchFilters | None = None,
+        **filter_kwargs,
+    ) -> list[Product]:
+        """Search products by free text, most relevant first.
+
+        ``category`` scopes the search to a category code (e.g. ``"m_0056"``), which
+        is the most effective way to stop "Parmesan" matching risotto seasoning.
+        Dietary filters can be passed inline::
+
+            coop.search("Milch", vegan=True)
+            coop.search("Pasta", category="m_0187", gluten_free=True)
+        """
+        if not query.strip():
+            raise ValueError("query must not be empty")
+        filters = self._merge_filters(filters, filter_kwargs)
+
+        if category:
+            params = urllib.parse.urlencode(
+                {"q": f"{query}:relevance", "pageSize": max(limit, 30)}
+            )
+            url = f"{BASE}/{self.locale}/c/{category}?{params}"
+        else:
+            params = urllib.parse.urlencode({"text": query, "pageSize": max(limit, 30)})
+            url = f"{BASE}/{self.locale}/search/?{params}"
+
+        self._session.goto(url, wait_for="[data-producttile-wrapper]")
+        self._apply_filters(filters)
+        return self._collect(limit)
+
+    def category(
+        self,
+        code: str,
+        limit: int = 30,
+        filters: SearchFilters | None = None,
+        **filter_kwargs,
+    ) -> list[Product]:
+        """List products in a category, e.g. ``"m_0056"`` (Milch)."""
+        params = urllib.parse.urlencode({"pageSize": max(limit, 30)})
+        url = f"{BASE}/{self.locale}/c/{code}?{params}"
+        self._session.goto(url, wait_for="[data-producttile-wrapper]")
+        self._apply_filters(self._merge_filters(filters, filter_kwargs))
+        return self._collect(limit)
+
+    def suggest_categories(self, query: str) -> list[dict[str, str]]:
+        """Categories Coop offers alongside the results for ``query``.
+
+        Useful for narrowing a vague ingredient: searching "Parmesan" suggests the
+        cheese categories, which you can then pass as ``category=``.
+        """
+        params = urllib.parse.urlencode({"text": query})
+        self._session.goto(
+            f"{BASE}/{self.locale}/search/?{params}", wait_for="[data-producttile-wrapper]"
+        )
+        seen: dict[str, str] = {}
+        for entry in self._session.page.evaluate(_EXTRACT_CATEGORIES):
+            seen.setdefault(entry["code"], entry["name"])
+        return [{"code": code, "name": name} for code, name in seen.items()]
+
+    def _merge_filters(self, filters: SearchFilters | None, kwargs: dict) -> SearchFilters:
+        if filters is not None and kwargs:
+            raise TypeError("Pass either a SearchFilters instance or keyword filters, not both.")
+        if filters is not None:
+            return filters
+        return SearchFilters.from_kwargs(**kwargs)
+
+    def _apply_filters(self, filters: SearchFilters) -> None:
+        """Tick the filter-panel checkboxes for ``filters``.
+
+        Coop applies facets through its own JavaScript, so each box is clicked and the
+        result count is watched. A filter that silently fails to apply would hand back
+        products violating a dietary restriction, so a checkbox that cannot be found
+        or does not change anything raises instead.
+        """
+        page = self._session.page
+        for checkbox_id in filters.checkbox_ids():
+            before = page.evaluate(_RESULT_COUNT)
+            clicked = page.evaluate(
+                """(id) => {
+                    const box = document.querySelector('#' + CSS.escape(id));
+                    if (!box) return false;
+                    if (!box.checked) box.click();
+                    return true;
+                }""",
+                checkbox_id,
+            )
+            if not clicked:
+                raise CoopError(
+                    f"Filter {checkbox_id!r} is not offered for this search. Coop only lists "
+                    "facets that match at least one result - try a broader query."
+                )
+            self._wait_for_count_change(before)
+
+    def _wait_for_count_change(self, before: str | None, timeout: float = 15000) -> None:
+        page = self._session.page
+        deadline = timeout
+        while deadline > 0:
+            page.wait_for_timeout(500)
+            deadline -= 500
+            if page.evaluate(_RESULT_COUNT) != before:
+                page.wait_for_timeout(1200)  # let the tile list settle
+                return
+        # Count may legitimately be unchanged if the facet excludes nothing.
+        page.wait_for_timeout(1000)
+
+    def _collect(self, limit: int) -> list[Product]:
+        raw = self._session.page.evaluate(_EXTRACT_TILES)
+        products: list[Product] = []
+        for r in raw[:limit]:
+            products.append(
+                Product(
+                    id=r["id"],
+                    name=r["name"],
+                    brand=r.get("brand"),
+                    price=parse_price(r.get("price")),
+                    quantity=r.get("quantity"),
+                    unit_price=r.get("unitPrice"),
+                    url=r.get("url"),
+                    in_stock=bool(r.get("inStock")),
+                    orderable=bool(r.get("orderable")),
+                    rating_count=int(r["ratingCount"]) if r.get("ratingCount") else None,
+                )
+            )
+        return products
+
+    # -- writing ----------------------------------------------------------------
+
+    def get_product(self, product: Product | str) -> ProductDetail:
+        """Fetch the full detail page for a product: ingredients, allergens, nutrition."""
+        product_id = product.id if isinstance(product, Product) else str(product)
+        self._open_product(product_id)
+        self._session.page.wait_for_timeout(1200)
+        raw = self._session.page.evaluate(_EXTRACT_PRODUCT)
+
+        sections = dict(raw.get("sections") or {})
+        ld = raw.get("ld") or {}
+        offers = ld.get("offers") or {}
+
+        # Consumed into dedicated fields; whatever is left stays in `info`.
+        # The ingredient block ends with a UI note pointing at the bold markup; that
+        # note is not an ingredient, and we already parsed the bold parts as allergens.
+        ingredients = sections.pop("Zutaten", None)
+        if ingredients:
+            ingredients = re.sub(r"\s*Allergiker-Infos:.*$", "", ingredients).strip() or None
+        origin = sections.pop("Rohstoffherkunft", None)
+        country = sections.pop("Produktionsland", None)
+        storage = sections.pop("Lagerung", None)
+        description = sections.pop("Beschreibung", None) or ld.get("description")
+        sections.pop("Nährwerte", None)  # only ever a "see details" link
+
+        return ProductDetail(
+            id=str(ld.get("productID") or product_id),
+            name=ld.get("name") or raw.get("name") or "",
+            brand=(ld.get("brand") or {}).get("name") if isinstance(ld.get("brand"), dict) else None,
+            price=parse_price(str(offers.get("price"))) if offers.get("price") is not None else None,
+            description=description,
+            gtin=ld.get("gtin8") or ld.get("gtin13") or ld.get("gtin"),
+            ingredients=ingredients,
+            allergens=list(raw.get("allergens") or []),
+            origin=origin,
+            production_country=country,
+            storage=storage,
+            nutrition=[(a, b) for a, b in raw.get("nutrition") or []],
+            nutrition_base=raw.get("nutritionBase"),
+            info=sections,
+            url=raw.get("url"),
+        )
+
+    # -- shopping lists ---------------------------------------------------------
+
+    def get_lists(self) -> list[ShoppingList]:
+        """All of the user's shopping lists, with the active one flagged."""
+        self._session.goto(f"{BASE}/{self.locale}/shopping-list")
+        self._session.require_login()
+        html = self._session.page.evaluate(
+            """async (locale) => {
+                const r = await fetch(`/${locale}/shopping-list/list/choose/modal`,
+                                      {headers: {'X-Requested-With': 'XMLHttpRequest'}});
+                return await r.text();
+            }""",
+            self.locale,
+        )
+        entries = self._session.page.evaluate(_EXTRACT_LISTS, html)
+        active = self.active_list_id()
+        return [
+            ShoppingList(id=e["id"], name=e["name"], active=e["id"] == active) for e in entries
+        ]
+
+    def active_list_id(self) -> str | None:
+        """The id of the list currently shown on the shopping-list page."""
+        # The toolbar carrying listId renders after the shell, so wait for it rather
+        # than reading early and concluding there is no active list.
+        try:
+            self._session.page.wait_for_selector('a[href*="listId="]', timeout=20000)
+        except PlaywrightTimeoutError:
+            return None
+        return self._session.page.evaluate(
+            """() => {
+                const a = document.querySelector('a[href*="listId="]');
+                if (!a) return null;
+                const m = (a.getAttribute('href') || '').match(/listId=([0-9A-Fa-f-]+)/);
+                return m ? m[1] : null;
+            }"""
+        )
+
+    def select_list(self, name_or_id: str) -> ShoppingList:
+        """Make a list the active one, by name (case-insensitive) or id.
+
+        Subsequent `get_list` / `add_to_list` calls act on this list.
+        """
+        target = self._find_list(name_or_id)
+        if target.active:
+            return target
+
+        self._session.page.locator(
+            f'a[href*="shopping-list/list/choose/modal"], '
+            f'[data-modal-src*="shopping-list/list/choose/modal"]'
+        ).first.click()
+        self._session.page.wait_for_selector(
+            f'[data-shopping-list-id="{target.id}"]', timeout=20000
+        )
+        self._session.page.locator(f'[data-shopping-list-id="{target.id}"]').first.click()
+        self._session.page.wait_for_timeout(4000)
+
+        self._session.goto(f"{BASE}/{self.locale}/shopping-list")
+        if self.active_list_id() != target.id:
+            raise CoopError(f"Tried to select list {target.name!r} but it did not become active.")
+        return dataclasses.replace(target, active=True)
+
+    def create_list(self, name: str) -> ShoppingList:
+        """Create a new shopping list.
+
+        Coop happily creates several lists with the same name, so this refuses to add a
+        duplicate rather than leaving you with two lists you cannot tell apart.
+        """
+        name = name.strip()
+        if not name:
+            raise ValueError("List name must not be empty.")
+        existing = self.get_lists()
+        if any(lst.name.casefold() == name.casefold() for lst in existing):
+            raise CoopError(f"A list named {name!r} already exists.")
+
+        page = self._session.page
+        page.locator(
+            'a[href*="shopping-list/list/choose/modal"], '
+            '[data-modal-src*="shopping-list/list/choose/modal"]'
+        ).first.click()
+        page.wait_for_selector('[data-modal-src*="showWishlistCreateModal"]', timeout=20000)
+        page.locator('[data-modal-src*="showWishlistCreateModal"]').first.click()
+        page.wait_for_selector('input[name="wishlistName"]', timeout=20000)
+        page.locator('input[name="wishlistName"]').first.fill(name)
+        # The submit control is a bare <button> - it has no type *attribute*, so a
+        # button[type="submit"] selector does not match it.
+        page.locator("form#coopathomeWishlistCreateNewListForm button").first.click()
+        page.wait_for_timeout(4000)
+
+        for lst in self.get_lists():
+            if lst.name.casefold() == name.casefold():
+                return lst
+        raise CoopError(f"Created list {name!r} but it did not show up in the list overview.")
+
+    def _find_list(self, name_or_id: str) -> ShoppingList:
+        lists = self.get_lists()
+        needle = name_or_id.strip().casefold()
+        for lst in lists:
+            if lst.id.casefold() == needle or lst.name.casefold() == needle:
+                return lst
+        matches = [lst for lst in lists if needle in lst.name.casefold()]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise CoopError(
+                f"{name_or_id!r} matches several lists: {[m.name for m in matches]}. Be more specific."
+            )
+        raise CoopError(
+            f"No shopping list matching {name_or_id!r}. Available: {[lst.name for lst in lists]}"
+        )
+
+    def get_list(self) -> list[ListItem]:
+        """Read the currently active Coop shopping list."""
+        self._session.goto(f"{BASE}/{self.locale}/shopping-list")
+        self._session.require_login()
+        self._wait_for_list_render()
+        items: list[ListItem] = []
+        for raw in self._session.page.evaluate(_EXTRACT_LIST):
+            qty = raw.get("quantity") or ""
+            digits = "".join(ch for ch in qty if ch.isdigit())
+            items.append(
+                ListItem(
+                    product_id=raw["productId"],
+                    entry_id=raw["entryId"],
+                    name=raw["name"],
+                    quantity=int(digits) if digits else 1,
+                    price=parse_price(raw.get("price")),
+                )
+            )
+        return items
+
+    def _wait_for_list_render(self, timeout: float = 30000) -> None:
+        """Block until the shopping list has actually rendered.
+
+        A fixed sleep is not enough - a long list can take several seconds, and reading
+        too early yields zero rows. That is worse than a slow read: `add_to_list` treats
+        an empty list as "not present yet" and would re-add products already on it. So
+        an empty result is only accepted once the list UI itself is up.
+        """
+        page = self._session.page
+        try:
+            page.wait_for_selector("li.shoppingList__item", timeout=timeout)
+            return
+        except PlaywrightTimeoutError:
+            pass
+
+        # No rows yet. Trust "empty" only if the list shell rendered without them.
+        try:
+            page.wait_for_selector('[data-testauto="tab-shoppinglist"]', timeout=10000)
+        except PlaywrightTimeoutError:
+            raise CoopError(
+                "The shopping list did not render within "
+                f"{timeout / 1000:g}s. Refusing to report it as empty, since that would "
+                "make add_to_list duplicate products already on the list."
+            ) from None
+        page.wait_for_timeout(1500)
+        if page.locator("li.shoppingList__item").count():
+            return
+
+    def add_to_list(self, product: Product | str) -> bool:
+        """Put a product on the active Coop shopping list.
+
+        Returns ``True`` if it was added, ``False`` if it was already there.
+
+        The control on the site is a toggle whose label does *not* reflect the current
+        state, so clicking blindly can remove an item or double-count it. The list
+        itself is therefore the source of truth: we look before we click, and confirm
+        afterwards.
+        """
+        product_id = product.id if isinstance(product, Product) else str(product)
+        if any(item.product_id == product_id for item in self.get_list()):
+            return False
+        self._click_add(product_id)
+        if not any(item.product_id == product_id for item in self.get_list()):
+            raise CoopError(
+                f"Clicked the shopping-list control for {product_id} but it did not appear "
+                "on the list. Coop may have changed the flow."
+            )
+        return True
+
+    def _click_add(self, product_id: str) -> None:
+        """Open a product page and hit its add-to-list control."""
+        self._open_product(product_id)
+        self._session.require_login()
+        button = self._session.page.locator(
+            f'[data-shopping-list-toggle][data-testauto$="{product_id}"]'
+        ).first
+        if not button.count():
+            button = self._session.page.locator("[data-shopping-list-toggle]").first
+        if not button.count():
+            raise CoopError(f"No shopping-list control found for product {product_id}.")
+        button.click()
+        self._session.page.wait_for_timeout(2000)
+
+    def remove_from_list(self, product: Product | str) -> bool:
+        """Take a product off the active shopping list.
+
+        Returns ``True`` if it was removed, ``False`` if it was not on the list.
+        """
+        product_id = product.id if isinstance(product, Product) else str(product)
+        if not any(item.product_id == product_id for item in self.get_list()):
+            return False
+
+        # The product page's toggle only ever adds; removal lives on the list row.
+        delete_icon = self._session.page.locator(
+            f'li.shoppingList__item[data-productid="{product_id}"] [data-shopping-list-item-remove]'
+        ).first
+        if not delete_icon.count():
+            raise CoopError(f"No delete control found on the list row for {product_id}.")
+        delete_icon.click()
+        self._session.page.wait_for_timeout(2500)
+
+        if any(item.product_id == product_id for item in self.get_list()):
+            raise CoopError(
+                f"Clicked the shopping-list control for {product_id} but it is still on "
+                "the list. Coop may have changed the flow."
+            )
+        return True
+
+    def add_many(self, products: list[Product | str]) -> dict[str, bool]:
+        """Add several products, skipping any already on the list.
+
+        Reads the list once up front and once at the end, rather than twice per
+        product - which matters when adding a whole recipe.
+        """
+        present = {item.product_id for item in self.get_list()}
+        results: dict[str, bool] = {}
+        added: list[str] = []
+        for product in products:
+            pid = product.id if isinstance(product, Product) else str(product)
+            if pid in present:
+                results[pid] = False
+                continue
+            self._click_add(pid)
+            present.add(pid)
+            added.append(pid)
+            results[pid] = True
+
+        if added:
+            final = {item.product_id for item in self.get_list()}
+            missing = [pid for pid in added if pid not in final]
+            if missing:
+                raise CoopError(
+                    f"These products were clicked but did not reach the list: {missing}. "
+                    "Coop may have changed the flow."
+                )
+        return results
+
+    def _open_product(self, product_id: str) -> None:
+        """Open a product's page. Coop resolves the short /p/<id> form for us."""
+        self._session.goto(
+            f"{BASE}/{self.locale}/p/{product_id}",
+            wait_for="[data-shopping-list-toggle]",
+        )
