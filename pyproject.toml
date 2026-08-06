@@ -19,7 +19,7 @@ grocery-api = "grocery.api:main"
 
 [dependency-groups]
 # httpx is what fastapi.testclient drives requests through.
-dev = ["pytest>=8.0", "httpx>=0.27"]
+dev = ["pytest>=8.0", "httpx>=0.27", "ruff>=0.14.6"]
 
 [build-system]
 requires = ["hatchling"]
