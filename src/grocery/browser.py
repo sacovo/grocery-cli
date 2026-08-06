@@ -145,13 +145,20 @@ class BrowserSession:
             self._owns_chrome = self._proc is not None
 
         self._pw = sync_playwright().start()
-        self._browser = self._pw.chromium.connect_over_cdp(
-            f"http://127.0.0.1:{self.port}"
-        )
-        if not self._browser.contexts:
-            raise GroceryError("Chrome exposed no browser context.")
-        ctx = self._browser.contexts[0]
-        self._page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        # A half-started session must not outlive a failure here: in a long-running
+        # process a leaked sync Playwright keeps its event loop parked in the thread,
+        # which poisons every later attempt to start one there.
+        try:
+            self._browser = self._pw.chromium.connect_over_cdp(
+                f"http://127.0.0.1:{self.port}"
+            )
+            if not self._browser.contexts:
+                raise GroceryError("Chrome exposed no browser context.")
+            ctx = self._browser.contexts[0]
+            self._page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        except BaseException:
+            self.close()
+            raise
         return self
 
     @property

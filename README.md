@@ -342,6 +342,48 @@ keyboard input.
 There is a Claude Code skill at `.claude/skills/coop-shopping/SKILL.md` describing this
 surface, including the latency characteristics and the filter-versus-preference rule.
 
+## HTTP API
+
+For automation platforms that speak HTTP rather than shelling out (n8n, Home
+Assistant, …), the same operations are exposed as a JSON API:
+
+```bash
+uv run grocery-api                    # binds 127.0.0.1:8377
+uv run grocery-api --host 0.0.0.0 --port 8377
+```
+
+It drives the same non-headless Chrome as the CLI: each request opens a client, does
+one operation and detaches, and a process-wide lock serialises browser work, so
+concurrent requests queue rather than fight over the single page. Interactive docs
+(and the OpenAPI schema n8n can import) are at `/docs` and `/openapi.json`.
+
+| Endpoint | Mirrors |
+| --- | --- |
+| `GET /health` | liveness, never touches Chrome |
+| `GET /status` | `coop status` |
+| `GET /search?q=…&limit=…&vegan=true…` | `coop search` |
+| `GET /categories?q=…` | `coop categories` |
+| `GET /products/{id}` | `coop product` |
+| `GET /list`, `GET /lists` | `coop list`, `coop lists` |
+| `POST /lists/active` `{"name_or_id": …}` | `coop use` |
+| `POST /lists` `{"name": …}` | `coop new-list` |
+| `DELETE /lists/{name_or_id}` | `coop delete-list` (Migros only, no confirmation) |
+| `POST /list/add`, `POST /list/remove` `{"product_ids": […]}` | `coop add` / `remove` |
+| `POST /recipe` `{"ingredients": […], "add": false, …}` | `coop recipe` |
+
+Every endpoint takes `?store=coop|migros` (default: `$GROCERY_STORE`, then coop).
+Errors map onto status codes the way the CLI maps them onto exit codes: 409 means a
+human has to log in at the Chrome window, 503 is the DataDome bot wall, 502 is the
+store misbehaving — each with a JSON body like
+`{"error": {"code": "not_logged_in", "message": …}}`. "Found nothing" is a 200 with
+`count: 0`, not an error.
+
+Set `GROCERY_API_TOKEN` to require `Authorization: Bearer <token>` on every request.
+Without it the API is open — fine on loopback, not fine anywhere else, so set it
+whenever n8n reaches this over a network (and front it with TLS). In n8n, use an
+HTTP Request node with Header Auth; give `/recipe` a generous timeout, since it runs
+one product search per ingredient.
+
 ## Development
 
 Code quality runs through [qlty](https://qlty.sh) (ruff for lint/format, bandit for
@@ -368,6 +410,7 @@ package launches Chrome, so it must import and call `subprocess`.
 | `recipes.py` | Ingredient-line parsing and candidate ranking |
 | `export.py` | CSV/JSON exports |
 | `cli.py` | Typer commands and the `--store` switch |
+| `api.py` | FastAPI app (`grocery-api`): the same operations over HTTP |
 | `stores/base.py` | The `Store` protocol and `Capabilities` |
 | `stores/coop/` | `extractors.py` (all Coop selectors), `client.py`, `filters.py` |
 | `stores/migros/` | `session.py` (token capture), `client.py` (JSON API) |

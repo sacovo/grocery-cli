@@ -101,7 +101,13 @@ class MigrosClient:
 
     def __enter__(self) -> MigrosClient:
         self._session.start()
-        self._session.authenticate()
+        try:
+            self._session.authenticate()
+        except BaseException:
+            # __exit__ never runs when __enter__ raises, so close here or the
+            # started session (and its Playwright event loop) leaks.
+            self.__exit__(None, None, None)
+            raise
         return self
 
     def __exit__(self, *exc: object) -> None:
